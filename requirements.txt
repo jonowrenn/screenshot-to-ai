@@ -1,0 +1,4 @@
+rumps>=0.4.0
+watchdog>=3.0.0
+pyautogui>=0.9.54
+Pillow>=10.0.0

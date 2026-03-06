@@ -87,11 +87,11 @@ def scan_all_ai_tabs() -> List[Dict]:
     """
     Scan every tab in every Chrome window and return a list of AI tabs.
     Each entry: {"window": int, "tab": int, "url": str, "title": str, "active": bool}
-    Used on startup and for the Choose Target menu.
+    Uses 'output' not 'result' — 'result' is a reserved AppleScript keyword.
     """
     out, err = run_applescript("""
     tell application "Google Chrome"
-        set result to ""
+        set output to ""
         set winIdx to 0
         repeat with w in windows
             set winIdx to winIdx + 1
@@ -103,29 +103,35 @@ def scan_all_ai_tabs() -> List[Dict]:
                 if u contains "claude.ai" or u contains "chat.openai.com" or u contains "chatgpt.com" then
                     set isActive to (tabIdx is equal to activeIdx)
                     set ttl to title of t
-                    set result to result & (winIdx as string) & "|" & (tabIdx as string) & "|" & u & "|" & ttl & "|" & (isActive as string) & "§"
+                    set output to output & (winIdx as string) & "|" & (tabIdx as string) & "|" & u & "|" & ttl & "|" & (isActive as string) & "~ENTRY~"
                 end if
             end repeat
         end repeat
-        return result
+        return output
     end tell
     """)
+    if err:
+        log(f"  scan_all_ai_tabs error: {err}")
     if not out:
         return []
     tabs = []
-    for entry in out.split("§"):
+    for entry in out.split("~ENTRY~"):
         entry = entry.strip()
         if not entry:
             continue
         parts = entry.split("|", 4)
         if len(parts) == 5:
-            tabs.append({
-                "window": int(parts[0]),
-                "tab":    int(parts[1]),
-                "url":    parts[2].lower(),
-                "title":  parts[3],
-                "active": parts[4].strip().lower() == "true",
-            })
+            try:
+                tabs.append({
+                    "window": int(parts[0]),
+                    "tab":    int(parts[1]),
+                    "url":    parts[2].lower(),
+                    "title":  parts[3],
+                    "active": parts[4].strip().lower() == "true",
+                })
+            except ValueError:
+                continue
+    log(f"  scan found {len(tabs)} AI tab(s)")
     return tabs
 
 
@@ -136,10 +142,11 @@ def find_active_ai_tab() -> Optional[Tuple[int, int]]:
         set winIdx to 0
         repeat with w in windows
             set winIdx to winIdx + 1
+            set activeIdx to active tab index of w
             set t to active tab of w
             set u to URL of t
             if u contains "claude.ai" or u contains "chat.openai.com" or u contains "chatgpt.com" then
-                return (winIdx as string) & "," & (active tab index of w as string)
+                return (winIdx as string) & "," & (activeIdx as string)
             end if
         end repeat
         return ""

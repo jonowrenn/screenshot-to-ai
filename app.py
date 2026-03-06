@@ -10,7 +10,7 @@ import time
 import threading
 import subprocess
 import glob
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List, Dict
 import rumps
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
@@ -34,7 +34,7 @@ def run_applescript(script: str) -> Tuple[str, str]:
     return result.stdout.strip(), result.stderr.strip()
 
 
-def get_screenshot_dirs() -> list:
+def get_screenshot_dirs() -> List[str]:
     dirs = []
     r = subprocess.run(
         ["defaults", "read", "com.apple.screencapture", "location"],
@@ -52,23 +52,120 @@ def get_screenshot_dirs() -> list:
 
 
 def is_real_screenshot(path: str) -> bool:
-    """
-    Return True only for fully-written, non-temporary screenshot files.
-    macOS first creates a hidden .Screenshot...png temp file, then renames
-    it to the final Screenshot...png — we only want the final file.
-    """
     name = os.path.basename(path)
-    # Ignore hidden / temp files (start with a dot)
     if name.startswith("."):
         return False
-    # Must be a recognised image extension
     _, ext = os.path.splitext(name)
-    if ext.lower() not in SCREENSHOT_EXTS:
-        return False
-    return True
+    return ext.lower() in SCREENSHOT_EXTS
 
 
-# ── Core functions ─────────────────────────────────────────────────────────────
+# ── Chrome tab helpers ─────────────────────────────────────────────────────────
+
+def get_tab_url(window_idx: int, tab_idx: int) -> str:
+    out, _ = run_applescript(f"""
+    tell application "Google Chrome"
+        return URL of tab {tab_idx} of window {window_idx}
+    end tell
+    """)
+    return out.lower()
+
+
+def get_tab_title(window_idx: int, tab_idx: int) -> str:
+    out, _ = run_applescript(f"""
+    tell application "Google Chrome"
+        return title of tab {tab_idx} of window {window_idx}
+    end tell
+    """)
+    return out
+
+
+def is_ai_url(url: str) -> bool:
+    return any(d in url for d in ["claude.ai", "chat.openai.com", "chatgpt.com"])
+
+
+def scan_all_ai_tabs() -> List[Dict]:
+    """
+    Scan every tab in every Chrome window and return a list of AI tabs.
+    Each entry: {"window": int, "tab": int, "url": str, "title": str, "active": bool}
+    Used on startup and for the Choose Target menu.
+    """
+    out, err = run_applescript("""
+    tell application "Google Chrome"
+        set result to ""
+        set winIdx to 0
+        repeat with w in windows
+            set winIdx to winIdx + 1
+            set activeIdx to active tab index of w
+            set tabIdx to 0
+            repeat with t in tabs of w
+                set tabIdx to tabIdx + 1
+                set u to URL of t
+                if u contains "claude.ai" or u contains "chat.openai.com" or u contains "chatgpt.com" then
+                    set isActive to (tabIdx is equal to activeIdx)
+                    set ttl to title of t
+                    set result to result & (winIdx as string) & "|" & (tabIdx as string) & "|" & u & "|" & ttl & "|" & (isActive as string) & "§"
+                end if
+            end repeat
+        end repeat
+        return result
+    end tell
+    """)
+    if not out:
+        return []
+    tabs = []
+    for entry in out.split("§"):
+        entry = entry.strip()
+        if not entry:
+            continue
+        parts = entry.split("|", 4)
+        if len(parts) == 5:
+            tabs.append({
+                "window": int(parts[0]),
+                "tab":    int(parts[1]),
+                "url":    parts[2].lower(),
+                "title":  parts[3],
+                "active": parts[4].strip().lower() == "true",
+            })
+    return tabs
+
+
+def find_active_ai_tab() -> Optional[Tuple[int, int]]:
+    """Only checks the currently visible tab of each window (front-to-back)."""
+    out, err = run_applescript("""
+    tell application "Google Chrome"
+        set winIdx to 0
+        repeat with w in windows
+            set winIdx to winIdx + 1
+            set t to active tab of w
+            set u to URL of t
+            if u contains "claude.ai" or u contains "chat.openai.com" or u contains "chatgpt.com" then
+                return (winIdx as string) & "," & (active tab index of w as string)
+            end if
+        end repeat
+        return ""
+    end tell
+    """)
+    if err:
+        log(f"  find_active_ai_tab error: {err}")
+    if not out:
+        return None
+    parts = out.split(",")
+    try:
+        return int(parts[0]), int(parts[1])
+    except (ValueError, IndexError):
+        return None
+
+
+def verify_tab(window_idx: int, tab_idx: int) -> bool:
+    url = get_tab_url(window_idx, tab_idx)
+    return is_ai_url(url)
+
+
+def service_name(url: str) -> str:
+    return "Claude" if "claude.ai" in url else "ChatGPT"
+
+
+# ── Clipboard & paste ──────────────────────────────────────────────────────────
 
 def copy_image_to_clipboard(filepath: str) -> bool:
     ext = os.path.splitext(filepath)[1].lower()
@@ -82,91 +179,12 @@ def copy_image_to_clipboard(filepath: str) -> bool:
     return True
 
 
-def find_ai_tab() -> Optional[Tuple[int, int]]:
-    """
-    Find the best Claude/ChatGPT tab to use, in priority order:
-      1. The active (foreground) tab of any window if it's an AI tab
-      2. Any other AI tab that is NOT in a collapsed tab group (loading=false trick)
-      3. Any AI tab as a last resort
-    Returns (window_index, tab_index) — 1-based — or None.
-    """
-    out, err = run_applescript("""
-    tell application "Google Chrome"
-        -- Pass 1: prefer the active tab if it's an AI tab
-        set winIdx to 0
-        repeat with w in windows
-            set winIdx to winIdx + 1
-            set activeTab to active tab of w
-            set u to URL of activeTab
-            if u contains "claude.ai" or u contains "chat.openai.com" or u contains "chatgpt.com" then
-                set activeTabIdx to active tab index of w
-                return "active," & (winIdx as string) & "," & (activeTabIdx as string)
-            end if
-        end repeat
-
-        -- Pass 2: any visible (loading or complete) AI tab
-        set winIdx to 0
-        repeat with w in windows
-            set winIdx to winIdx + 1
-            set tabIdx to 0
-            repeat with t in tabs of w
-                set tabIdx to tabIdx + 1
-                set u to URL of t
-                if u contains "claude.ai" or u contains "chat.openai.com" or u contains "chatgpt.com" then
-                    -- Prefer tabs that are the active tab of their window
-                    if tabIdx is equal to (active tab index of w) then
-                        return "active," & (winIdx as string) & "," & (tabIdx as string)
-                    end if
-                end if
-            end repeat
-        end repeat
-
-        -- Pass 3: any AI tab at all
-        set winIdx to 0
-        repeat with w in windows
-            set winIdx to winIdx + 1
-            set tabIdx to 0
-            repeat with t in tabs of w
-                set tabIdx to tabIdx + 1
-                set u to URL of t
-                if u contains "claude.ai" or u contains "chat.openai.com" or u contains "chatgpt.com" then
-                    return "any," & (winIdx as string) & "," & (tabIdx as string)
-                end if
-            end repeat
-        end repeat
-
-        return ""
-    end tell
-    """)
-    if err:
-        log(f"  find_ai_tab error: {err}")
-    if not out:
-        return None
-    parts = out.split(",")
-    try:
-        # parts = ["active"/"any", window_idx, tab_idx]
-        return int(parts[1]), int(parts[2])
-    except (ValueError, IndexError):
-        return None
-
-
-def get_tab_url(window_idx: int, tab_idx: int) -> str:
-    out, _ = run_applescript(f"""
-    tell application "Google Chrome"
-        return URL of tab {tab_idx} of window {window_idx}
-    end tell
-    """)
-    return out.lower()
-
-
 def activate_tab_and_paste(window_idx: int, tab_idx: int, filepath: str) -> bool:
-    # ── Step 1: Copy image to clipboard ──────────────────────────────────────
     log("  Step 1: Copying image to clipboard...")
     if not copy_image_to_clipboard(filepath):
         return False
     log("  Step 1: ✅ clipboard set")
 
-    # ── Step 2: Activate Chrome and the right tab ─────────────────────────────
     log("  Step 2: Activating Chrome tab...")
     _, err = run_applescript(f"""
     tell application "Google Chrome"
@@ -177,48 +195,56 @@ def activate_tab_and_paste(window_idx: int, tab_idx: int, filepath: str) -> bool
     """)
     if err:
         log(f"  Step 2 warning: {err}")
-    time.sleep(0.8)
+    time.sleep(1.0)
     log("  Step 2: ✅ Chrome activated")
 
-    # ── Step 3: Click the chat input ──────────────────────────────────────────
-    log("  Step 3: Clicking chat input...")
-    bounds_out, err = run_applescript(f"""
+    log("  Step 3: Focusing input via JavaScript...")
+    js = (
+        "(function(){"
+        "var el=document.getElementById('prompt-textarea');"
+        "if(!el)el=document.querySelector('.ProseMirror');"
+        "if(!el)el=document.querySelector('[contenteditable=\"true\"]');"
+        "if(!el)el=document.querySelector('textarea');"
+        "if(el){el.click();el.focus();"
+        "return 'focused:'+el.tagName+(el.id?'#'+el.id:'');}"
+        "return 'INPUT NOT FOUND';})()"
+    )
+    js_result, js_err = run_applescript(f"""
     tell application "Google Chrome"
-        return bounds of window {window_idx}
+        tell tab {tab_idx} of window {window_idx}
+            execute javascript "{js}"
+        end tell
     end tell
     """)
-    if err or not bounds_out:
-        log(f"  Step 3 bounds error: {err}")
-    else:
-        try:
-            coords  = [int(x.strip()) for x in bounds_out.split(",")]
+    log(f"  Step 3 JS: {js_result or js_err or 'no output'}")
+
+    if "INPUT NOT FOUND" in (js_result or "") or not js_result:
+        log("  Step 3b: JS focus failed — trying coordinate fallback...")
+        bounds_out, _ = run_applescript(f"""
+        tell application "Google Chrome"
+            return bounds of window {window_idx}
+        end tell
+        """)
+        if bounds_out:
+            coords = [int(x.strip()) for x in bounds_out.split(",")]
             left, top, right, bottom = coords
-            click_x = (left + right) // 2
-            click_y = bottom - 110       # chat input is near the bottom
-            log(f"  Step 3: clicking at ({click_x}, {click_y})")
-            _, err = run_applescript(f"""
-            tell application "System Events"
-                tell process "Google Chrome"
-                    click at {{{click_x}, {click_y}}}
+            cx = (left + right) // 2
+            for offset in [75, 55, 95]:
+                run_applescript(f"""
+                tell application "System Events"
+                    tell process "Google Chrome"
+                        click at {{{cx}, {bottom - offset}}}
+                    end tell
                 end tell
-            end tell
-            """)
-            if err:
-                log(f"  Step 3 click warning: {err}")
-            else:
-                log("  Step 3: ✅ clicked")
-        except Exception as e:
-            log(f"  Step 3 exception: {e}")
+                """)
+                time.sleep(0.15)
 
-    time.sleep(0.4)
+    time.sleep(0.5)
 
-    # ── Step 4: Paste ─────────────────────────────────────────────────────────
     log("  Step 4: Sending Cmd+V...")
-    _, err = run_applescript("""
-    tell application "System Events"
-        key code 9 using command down
-    end tell
-    """)
+    _, err = run_applescript(
+        'tell application "System Events" to key code 9 using command down'
+    )
     if err:
         log(f"  Step 4 error: {err}")
         return False
@@ -235,29 +261,19 @@ class ScreenshotHandler(FileSystemEventHandler):
         self._last_fired: float = 0
 
     def on_created(self, event):
-        if event.is_directory:
-            return
-        # Ignore the hidden temp file macOS creates first (.Screenshot...png)
-        if not is_real_screenshot(event.src_path):
-            return
-        self._trigger(event.src_path)
+        if not event.is_directory and is_real_screenshot(event.src_path):
+            self._trigger(event.src_path)
 
     def on_moved(self, event):
-        # macOS renames the temp file to the final name — catch that too
-        if event.is_directory:
-            return
-        if not is_real_screenshot(event.dest_path):
-            return
-        self._trigger(event.dest_path)
+        if not event.is_directory and is_real_screenshot(event.dest_path):
+            self._trigger(event.dest_path)
 
     def _trigger(self, path: str):
         now = time.time()
         if now - self._last_fired < DEBOUNCE_SECONDS:
-            log(f"  (debounced: {os.path.basename(path)})")
             return
         self._last_fired = now
         log(f"📸 Detected: {os.path.basename(path)}")
-        # Wait for macOS to finish writing the file
         time.sleep(1.0)
         self.app.handle_new_screenshot(path)
 
@@ -267,21 +283,118 @@ class ScreenshotHandler(FileSystemEventHandler):
 class ScreenshotToAIApp(rumps.App):
     def __init__(self):
         super().__init__(name="ScreenshotToAI", title="📸", quit_button="Quit")
-        self.enabled = True
+        self.enabled  = True
         self.observer = None
 
+        # Pinned target: set explicitly via "Choose Target" menu.
+        # When set, ALL screenshots go here regardless of active tab.
+        self._pinned_tab:     Optional[Tuple[int, int]] = None
+        self._pinned_service: str = ""
+
+        # Fallback memory: last tab we successfully pasted to.
+        self._last_tab:     Optional[Tuple[int, int]] = None
+        self._last_service: str = ""
+
         self.toggle_item = rumps.MenuItem("Auto-paste: ON ✅", callback=self.toggle)
-        self.status_item = rumps.MenuItem("Last: —")
+        self.target_item = rumps.MenuItem("🎯 Choose target tab", callback=self.choose_target)
+        self.pin_item    = rumps.MenuItem("📌 Target: none — will auto-detect")
         self.test_item   = rumps.MenuItem("🔁 Paste last screenshot", callback=self.paste_last)
+        self.status_item = rumps.MenuItem("Last: —")
+
+        # pin_item is display-only
+        self.pin_item.set_callback(None)
 
         self.menu = [
             self.toggle_item,
+            None,
+            self.target_item,
+            self.pin_item,
             None,
             self.test_item,
             None,
             self.status_item,
         ]
+
         self._start_watcher()
+
+        # Auto-discover an AI tab on startup so first screenshot works immediately
+        threading.Thread(target=self._auto_discover, daemon=True).start()
+
+    # ── Auto-discover on startup ───────────────────────────────────────────────
+
+    def _auto_discover(self):
+        """Scan all Chrome tabs on startup and remember the best AI tab found."""
+        time.sleep(1.5)  # let the app finish initialising
+        tabs = scan_all_ai_tabs()
+        if not tabs:
+            log("Startup scan: no AI tabs found in Chrome")
+            return
+        # Prefer an active tab, otherwise take the first one found
+        active = [t for t in tabs if t["active"]]
+        best   = active[0] if active else tabs[0]
+        self._last_tab     = (best["window"], best["tab"])
+        self._last_service = service_name(best["url"])
+        log(f"Startup scan: auto-discovered {self._last_service} "
+            f"(window {best['window']}, tab {best['tab']}) — '{best['title'][:60]}'")
+        self._update_pin_label()
+
+    # ── Choose target ──────────────────────────────────────────────────────────
+
+    def choose_target(self, _):
+        """Show all open AI tabs; clicking one pins it as the target."""
+        tabs = scan_all_ai_tabs()
+        if not tabs:
+            self._notify("No AI tabs open ⚠️", "Open Claude.ai or ChatGPT in Chrome first.")
+            return
+
+        # Build a sub-window using rumps alert with a numbered list
+        lines = []
+        for i, t in enumerate(tabs, 1):
+            active_marker = " ◀ active" if t["active"] else ""
+            svc = service_name(t["url"])
+            title_short = t["title"][:55] + "…" if len(t["title"]) > 55 else t["title"]
+            lines.append(f"{i}. [{svc}] {title_short}{active_marker}")
+
+        # rumps doesn't support dynamic submenus well, so show a dialog
+        choices = "\n".join(lines)
+        script = f"""
+        set choices to "{choices.replace('"', "'")}"
+        set answer to display dialog "Choose which tab to pin as the screenshot target:\\n\\n" & choices ¬
+            with title "Screenshot to AI — Choose Target" ¬
+            default answer "1" ¬
+            buttons {{"Cancel", "Pin this tab"}} ¬
+            default button "Pin this tab"
+        return text returned of answer
+        """
+        out, err = run_applescript(script)
+        if err or not out:
+            return  # user cancelled
+
+        try:
+            idx = int(out.strip()) - 1
+            chosen = tabs[idx]
+        except (ValueError, IndexError):
+            self._notify("Invalid choice", f"Enter a number between 1 and {len(tabs)}.")
+            return
+
+        self._pinned_tab     = (chosen["window"], chosen["tab"])
+        self._pinned_service = service_name(chosen["url"])
+        self._last_tab       = self._pinned_tab
+        self._last_service   = self._pinned_service
+        self._update_pin_label()
+        log(f"Pinned target: {self._pinned_service} — window {chosen['window']}, tab {chosen['tab']}")
+        self._notify(
+            f"Pinned to {self._pinned_service} 📌",
+            f"All screenshots will go to: {chosen['title'][:60]}"
+        )
+
+    def _update_pin_label(self):
+        if self._pinned_tab:
+            self.pin_item.title = f"📌 Pinned: {self._pinned_service}"
+        elif self._last_tab:
+            self.pin_item.title = f"📌 Target: {self._last_service} (auto)"
+        else:
+            self.pin_item.title = "📌 Target: none — will auto-detect"
 
     # ── Toggle ────────────────────────────────────────────────────────────────
 
@@ -301,12 +414,11 @@ class ScreenshotToAIApp(rumps.App):
     # ── Manual retry ──────────────────────────────────────────────────────────
 
     def paste_last(self, _):
-        dirs = get_screenshot_dirs()
         candidates = []
-        for d in dirs:
-            for ext in ("*.png", "*.jpg", "*.jpeg"):
+        for d in get_screenshot_dirs():
+            for pattern in ("Screenshot*.png", "Screenshot*.jpg", "Screenshot*.jpeg"):
                 candidates += [
-                    f for f in glob.glob(os.path.join(d, f"Screenshot{ext[1:]}"))
+                    f for f in glob.glob(os.path.join(d, pattern))
                     if not os.path.basename(f).startswith(".")
                 ]
         if not candidates:
@@ -339,31 +451,63 @@ class ScreenshotToAIApp(rumps.App):
     def handle_new_screenshot(self, filepath: str):
         if not self.enabled:
             return
-        threading.Thread(
-            target=self._paste_screenshot, args=(filepath,), daemon=True
-        ).start()
+        threading.Thread(target=self._paste_screenshot, args=(filepath,), daemon=True).start()
 
     def _paste_screenshot(self, filepath: str):
         filename = os.path.basename(filepath)
         log(f"Processing: {filename}")
 
-        tab = find_ai_tab()
+        # Priority 1 — explicitly pinned tab
+        tab, used_pin, used_fallback = None, False, False
+
+        if self._pinned_tab and verify_tab(*self._pinned_tab):
+            tab      = self._pinned_tab
+            used_pin = True
+            log(f"  Using pinned tab: {self._pinned_service}")
+
+        # Priority 2 — currently active AI tab in Chrome
         if tab is None:
-            log("  ❌ No Claude/ChatGPT tab found")
-            self._notify("No AI tab found ⚠️", "Open Claude.ai or ChatGPT in Chrome.")
+            tab = find_active_ai_tab()
+            if tab:
+                log(f"  Using active AI tab: window {tab[0]}, tab {tab[1]}")
+
+        # Priority 3 — last successfully used tab (e.g. screenshotting from Notability)
+        if tab is None and self._last_tab and verify_tab(*self._last_tab):
+            tab           = self._last_tab
+            used_fallback = True
+            log(f"  No active AI tab — using last used: {self._last_service}")
+
+        if tab is None:
+            log("  ❌ No AI tab found")
+            self._notify(
+                "No AI tab found ⚠️",
+                "Open Claude.ai or ChatGPT in Chrome, or use 🎯 Choose target tab."
+            )
             self._set_status("⚠️  No AI tab found")
             return
 
-        log(f"  Found tab: window {tab[0]}, tab {tab[1]}")
-        url     = get_tab_url(tab[0], tab[1])
-        service = "Claude" if "claude.ai" in url else "ChatGPT"
-        log(f"  Service: {service}")
+        url  = get_tab_url(tab[0], tab[1])
+        svc  = service_name(url)
+        log(f"  Target: {svc} (window {tab[0]}, tab {tab[1]})")
 
         try:
             if activate_tab_and_paste(tab[0], tab[1], filepath):
-                self._notify(f"Pasted to {service} ✅", filename)
-                self._set_status(f"✅  {filename} → {service}")
-                log(f"✅ Done")
+                # Update memory (but don't overwrite an explicit pin)
+                if not used_pin:
+                    self._last_tab     = tab
+                    self._last_service = svc
+                    self._update_pin_label()
+
+                if used_pin:
+                    label = f"{svc} 📌"
+                elif used_fallback:
+                    label = f"{svc} (remembered)"
+                else:
+                    label = svc
+
+                self._notify(f"Pasted to {label} ✅", filename)
+                self._set_status(f"✅  {filename} → {label}")
+                log(f"✅ Done → {label}")
             else:
                 self._notify("Clipboard error ❌", "Could not copy image.")
                 self._set_status("❌  clipboard error")

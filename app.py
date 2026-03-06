@@ -15,6 +15,66 @@ import rumps
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
+# ── NSSwitch toggle (macOS 10.15+) ─────────────────────────────────────────────
+# Embeds a real iOS-style toggle switch directly inside a menu item view.
+# Falls back to a plain checkmark if PyObjC / NSSwitch is unavailable.
+
+try:
+    import objc
+    from Foundation import NSObject
+    from AppKit import (
+        NSMenuItem, NSView, NSSwitch, NSTextField,
+        NSFont, NSColor, NSMakeRect,
+    )
+    _NSSWITCH_AVAILABLE = True
+except Exception:
+    _NSSWITCH_AVAILABLE = False
+
+
+if _NSSWITCH_AVAILABLE:
+
+    class _SwitchTarget(NSObject):
+        """Thin ObjC target that forwards NSSwitch actions to a Python callable."""
+
+        @objc.python_method
+        def init_with_callback(self, callback):
+            self = self.init()
+            self._cb = callback
+            return self
+
+        def toggled_(self, sender):
+            self._cb(bool(sender.state()))
+
+
+    def _attach_switch(rumps_item, label: str, initial_on: bool, callback):
+        """
+        Replace *rumps_item*'s NSMenuItem view with a label + NSSwitch row.
+        Returns the (_SwitchTarget, NSSwitch) tuple so callers can keep refs alive.
+        """
+        W, H = 230, 30
+
+        view = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, W, H))
+
+        # Label
+        lbl = NSTextField.labelWithString_(label)
+        lbl.setFrame_(NSMakeRect(14, 6, 150, 18))
+        lbl.setFont_(NSFont.menuFontOfSize_(13.0))
+        view.addSubview_(lbl)
+
+        # NSSwitch
+        sw = NSSwitch.alloc().initWithFrame_(NSMakeRect(168, 4, 51, 22))
+        sw.setState_(1 if initial_on else 0)
+
+        target = _SwitchTarget.alloc().init_with_callback(callback)
+        sw.setTarget_(target)
+        sw.setAction_(objc.selector(target.toggled_, signature=b'v@:@'))
+        view.addSubview_(sw)
+
+        # rumps.MenuItem IS an NSMenuItem subclass — setView_ works directly
+        rumps_item.setView_(view)
+
+        return target, sw  # caller must hold refs or they get GC'd
+
 # ── Config ─────────────────────────────────────────────────────────────────────
 
 SCREENSHOT_EXTS  = {".png", ".jpg", ".jpeg"}
@@ -303,18 +363,9 @@ class ScreenshotToAIApp(rumps.App):
         self._last_service: str = ""
 
         # ── Menu items ────────────────────────────────────────────────────────
-        # toggle_item uses a native macOS checkmark (state=1) for ON,
-        # no mark (state=0) for OFF — the most standard macOS toggle pattern.
         self.toggle_item = rumps.MenuItem("Auto-paste", callback=self.toggle)
-        self.toggle_item.state = 1          # starts ON
-
-        # "Set target tab" — one click pins whatever AI tab is active in Chrome.
-        # Falls back to a picker dialog only if no AI tab is currently active.
         self.target_item = rumps.MenuItem("🎯 Set target tab", callback=self.set_target)
-
-        # Shows the current target; click it to clear the pin.
         self.pin_item    = rumps.MenuItem("   No target set — auto-detect", callback=self.clear_pin)
-
         self.test_item   = rumps.MenuItem("🔁 Paste last screenshot", callback=self.paste_last)
         self.status_item = rumps.MenuItem("Last: —")
         self.status_item.set_callback(None)
@@ -329,6 +380,26 @@ class ScreenshotToAIApp(rumps.App):
             None,
             self.status_item,
         ]
+
+        # ── Attach iOS-style NSSwitch to the Auto-paste toggle ────────────────
+        # Must happen AFTER self.menu is assigned (so the NSMenuItem exists).
+        self._switch_refs = None   # keep ObjC objects alive
+        self._nsswitch    = None
+        if _NSSWITCH_AVAILABLE:
+            try:
+                target_ref, sw = _attach_switch(
+                    self.toggle_item, "Auto-paste",
+                    initial_on=True,
+                    callback=self._on_switch_toggled,
+                )
+                self._switch_refs = target_ref
+                self._nsswitch    = sw
+                log("NSSwitch toggle attached ✅")
+            except Exception as e:
+                log(f"NSSwitch unavailable ({e}), using checkmark fallback")
+                self.toggle_item.state = 1
+        else:
+            self.toggle_item.state = 1   # fallback: plain checkmark
 
         self._start_watcher()
 
@@ -355,12 +426,25 @@ class ScreenshotToAIApp(rumps.App):
 
     # ── Toggle ────────────────────────────────────────────────────────────────
 
+    def _on_switch_toggled(self, is_on: bool):
+        """Called by the NSSwitch when the user flips it."""
+        self._apply_toggle(is_on)
+
     def toggle(self, sender):
-        self.enabled = not self.enabled
-        # state=1 → native macOS checkmark (ON), state=0 → no mark (OFF)
-        sender.state = 1 if self.enabled else 0
-        self.title   = "📸" if self.enabled else "📸✕"
-        if self.enabled:
+        """Called when the menu item row is clicked (fallback / keyboard nav)."""
+        new_state = not self.enabled
+        # Keep the NSSwitch in sync if it exists
+        if self._nsswitch is not None:
+            self._nsswitch.setState_(1 if new_state else 0)
+        self._apply_toggle(new_state)
+        # Update checkmark fallback
+        if self._nsswitch is None:
+            sender.state = 1 if new_state else 0
+
+    def _apply_toggle(self, is_on: bool):
+        self.enabled = is_on
+        self.title   = "📸" if is_on else "📸✕"
+        if is_on:
             self._start_watcher()
             log("Auto-paste enabled")
         else:

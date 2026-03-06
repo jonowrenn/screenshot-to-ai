@@ -302,14 +302,22 @@ class ScreenshotToAIApp(rumps.App):
         self._last_tab:     Optional[Tuple[int, int]] = None
         self._last_service: str = ""
 
-        self.toggle_item = rumps.MenuItem("Auto-paste: ON ✅", callback=self.toggle)
-        self.target_item = rumps.MenuItem("🎯 Choose target tab", callback=self.choose_target)
-        self.pin_item    = rumps.MenuItem("📌 Target: none — will auto-detect")
+        # ── Menu items ────────────────────────────────────────────────────────
+        # toggle_item uses a native macOS checkmark (state=1) for ON,
+        # no mark (state=0) for OFF — the most standard macOS toggle pattern.
+        self.toggle_item = rumps.MenuItem("Auto-paste", callback=self.toggle)
+        self.toggle_item.state = 1          # starts ON
+
+        # "Set target tab" — one click pins whatever AI tab is active in Chrome.
+        # Falls back to a picker dialog only if no AI tab is currently active.
+        self.target_item = rumps.MenuItem("🎯 Set target tab", callback=self.set_target)
+
+        # Shows the current target; click it to clear the pin.
+        self.pin_item    = rumps.MenuItem("   No target set — auto-detect", callback=self.clear_pin)
+
         self.test_item   = rumps.MenuItem("🔁 Paste last screenshot", callback=self.paste_last)
         self.status_item = rumps.MenuItem("Last: —")
-
-        # pin_item is display-only
-        self.pin_item.set_callback(None)
+        self.status_item.set_callback(None)
 
         self.menu = [
             self.toggle_item,
@@ -345,78 +353,98 @@ class ScreenshotToAIApp(rumps.App):
             f"(window {best['window']}, tab {best['tab']}) — '{best['title'][:60]}'")
         self._update_pin_label()
 
-    # ── Choose target ──────────────────────────────────────────────────────────
+    # ── Toggle ────────────────────────────────────────────────────────────────
 
-    def choose_target(self, _):
-        """Show all open AI tabs; clicking one pins it as the target."""
+    def toggle(self, sender):
+        self.enabled = not self.enabled
+        # state=1 → native macOS checkmark (ON), state=0 → no mark (OFF)
+        sender.state = 1 if self.enabled else 0
+        self.title   = "📸" if self.enabled else "📸✕"
+        if self.enabled:
+            self._start_watcher()
+            log("Auto-paste enabled")
+        else:
+            self._stop_watcher()
+            log("Auto-paste disabled")
+
+    # ── Set target tab ────────────────────────────────────────────────────────
+
+    def set_target(self, _):
+        """
+        Smart one-click target setter:
+          • If the currently active Chrome tab IS an AI tab → pin it immediately.
+          • Otherwise → show a numbered picker of all open AI tabs.
+        """
+        active = find_active_ai_tab()
+
+        if active:
+            # The user is already in an AI tab — pin it without any dialog
+            url   = get_tab_url(active[0], active[1])
+            title = get_tab_title(active[0], active[1])
+            svc   = service_name(url)
+            self._pin(active, svc, title)
+            return
+
+        # Not in an AI tab — show a picker
         tabs = scan_all_ai_tabs()
         if not tabs:
             self._notify("No AI tabs open ⚠️", "Open Claude.ai or ChatGPT in Chrome first.")
             return
 
-        # Build a sub-window using rumps alert with a numbered list
         lines = []
         for i, t in enumerate(tabs, 1):
-            active_marker = " ◀ active" if t["active"] else ""
-            svc = service_name(t["url"])
-            title_short = t["title"][:55] + "…" if len(t["title"]) > 55 else t["title"]
-            lines.append(f"{i}. [{svc}] {title_short}{active_marker}")
+            svc         = service_name(t["url"])
+            title_short = t["title"][:52] + "…" if len(t["title"]) > 52 else t["title"]
+            marker      = "  ◀ active" if t["active"] else ""
+            lines.append(f"{i}.  [{svc}]  {title_short}{marker}")
 
-        # rumps doesn't support dynamic submenus well, so show a dialog
-        choices = "\n".join(lines)
-        script = f"""
-        set choices to "{choices.replace('"', "'")}"
-        set answer to display dialog "Choose which tab to pin as the screenshot target:\\n\\n" & choices ¬
-            with title "Screenshot to AI — Choose Target" ¬
-            default answer "1" ¬
-            buttons {{"Cancel", "Pin this tab"}} ¬
-            default button "Pin this tab"
-        return text returned of answer
-        """
+        choices = "\\n".join(lines)
+        script  = (
+            f'set answer to display dialog "Switch to an AI tab and click Set target tab — or pick one below:\\n\\n{choices}" '
+            f'with title "Screenshot to AI" '
+            f'default answer "1" '
+            f'buttons {{"Cancel", "Pin"}} '
+            f'default button "Pin"\n'
+            f'return text returned of answer'
+        )
         out, err = run_applescript(script)
         if err or not out:
-            return  # user cancelled
-
+            return
         try:
-            idx = int(out.strip()) - 1
-            chosen = tabs[idx]
+            chosen = tabs[int(out.strip()) - 1]
         except (ValueError, IndexError):
-            self._notify("Invalid choice", f"Enter a number between 1 and {len(tabs)}.")
+            self._notify("Invalid choice", f"Enter 1–{len(tabs)}.")
             return
 
-        self._pinned_tab     = (chosen["window"], chosen["tab"])
-        self._pinned_service = service_name(chosen["url"])
-        self._last_tab       = self._pinned_tab
-        self._last_service   = self._pinned_service
+        svc = service_name(chosen["url"])
+        self._pin((chosen["window"], chosen["tab"]), svc, chosen["title"])
+
+    def _pin(self, tab: Tuple[int, int], svc: str, title: str):
+        self._pinned_tab     = tab
+        self._pinned_service = svc
+        self._last_tab       = tab
+        self._last_service   = svc
         self._update_pin_label()
-        log(f"Pinned target: {self._pinned_service} — window {chosen['window']}, tab {chosen['tab']}")
-        self._notify(
-            f"Pinned to {self._pinned_service} 📌",
-            f"All screenshots will go to: {chosen['title'][:60]}"
-        )
+        log(f"Pinned: {svc} — window {tab[0]}, tab {tab[1]} — '{title[:60]}'")
+        self._notify(f"Pinned to {svc} 📌", f"→ {title[:60]}")
+
+    def clear_pin(self, _):
+        """Click the pin label to clear the explicit pin and return to auto-detect."""
+        if not self._pinned_tab:
+            return
+        log(f"Pin cleared (was {self._pinned_service})")
+        self._pinned_tab     = None
+        self._pinned_service = ""
+        self._update_pin_label()
+        self._notify("Pin cleared", "Back to auto-detect mode.")
 
     def _update_pin_label(self):
         if self._pinned_tab:
-            self.pin_item.title = f"📌 Pinned: {self._pinned_service}"
+            self.pin_item.title = f"   📌 {self._pinned_service} pinned  (click to clear)"
         elif self._last_tab:
-            self.pin_item.title = f"📌 Target: {self._last_service} (auto)"
+            self.pin_item.title = f"   🔍 Auto: {self._last_service} (no pin)"
         else:
-            self.pin_item.title = "📌 Target: none — will auto-detect"
-
-    # ── Toggle ────────────────────────────────────────────────────────────────
-
-    def toggle(self, sender):
-        self.enabled = not self.enabled
-        if self.enabled:
-            sender.title = "Auto-paste: ON ✅"
-            self.title = "📸"
-            self._start_watcher()
-            log("Auto-paste enabled")
-        else:
-            sender.title = "Auto-paste: OFF ⏸"
-            self.title = "📸✕"
-            self._stop_watcher()
-            log("Auto-paste disabled")
+            self.pin_item.title = "   No target set — auto-detect"
 
     # ── Manual retry ──────────────────────────────────────────────────────────
 

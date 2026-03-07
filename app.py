@@ -24,7 +24,7 @@ try:
     from Foundation import NSObject
     from AppKit import (
         NSMenuItem, NSView, NSSwitch, NSTextField,
-        NSFont, NSColor, NSMakeRect,
+        NSFont, NSColor, NSMakeRect, NSAppearance,
     )
     _NSSWITCH_AVAILABLE = True
 except Exception:
@@ -449,10 +449,15 @@ class ScreenshotToAIApp(rumps.App):
 
             # NSSwitch (macOS 10.15+ blue pill toggle)
             sw = NSSwitch.alloc().initWithFrame_(NSMakeRect(188, 8, 51, 22))
-            sw.setState_(1 if self.enabled else 0)
-            # Try forcing the blue control tint (NSBlueControlTint = 1)
+
+            # Force Aqua (light) appearance on the switch so it always renders
+            # the vivid blue pill regardless of the system dark-mode setting.
+            # Menu items render in a dark context; without this the ON-state
+            # blue blends into the grey and looks identical to OFF.
             try:
-                sw.cell().setControlTint_(1)
+                sw.setAppearance_(
+                    NSAppearance.appearanceNamed_("NSAppearanceNameAqua")
+                )
             except Exception:
                 pass
 
@@ -497,6 +502,11 @@ class ScreenshotToAIApp(rumps.App):
 
             ns_item.setView_(view)
 
+            # Set state and force a redraw AFTER the view is in the display
+            # hierarchy — this ensures the ON blue colour renders correctly.
+            sw.setState_(1 if self.enabled else 0)
+            sw.setNeedsDisplay_(True)
+
             # Keep ObjC objects alive (Python GC would free them otherwise)
             self._switch_refs    = tgt
             self._nsswitch       = sw
@@ -508,16 +518,19 @@ class ScreenshotToAIApp(rumps.App):
             self.toggle_item.state = 1 if self.enabled else 0
 
     def _update_toggle_badge(self):
-        """Refresh the green ON / grey OFF badge text and color."""
+        """Refresh the green ON / grey OFF badge and force-redraw the switch."""
         badge = getattr(self, "_toggle_badge", None)
-        if badge is None:
-            return
-        if self.enabled:
-            badge.setStringValue_("ON")
-            badge.setTextColor_(NSColor.systemGreenColor())
-        else:
-            badge.setStringValue_("OFF")
-            badge.setTextColor_(NSColor.secondaryLabelColor())
+        if badge is not None:
+            if self.enabled:
+                badge.setStringValue_("ON")
+                badge.setTextColor_(NSColor.systemGreenColor())
+            else:
+                badge.setStringValue_("OFF")
+                badge.setTextColor_(NSColor.secondaryLabelColor())
+        # Force the NSSwitch to repaint so the blue/grey colour updates promptly
+        sw = getattr(self, "_nsswitch", None)
+        if sw is not None:
+            sw.setNeedsDisplay_(True)
 
     # ── Auto-discover on startup ───────────────────────────────────────────────
 

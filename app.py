@@ -13,8 +13,14 @@ import subprocess
 import glob
 from typing import Optional, Tuple, List, Dict
 import rumps
-from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler
+
+# watchdog is only used as a fallback if Spotlight is unavailable
+try:
+    from watchdog.observers import Observer
+    from watchdog.events import FileSystemEventHandler
+    _WATCHDOG_AVAILABLE = True
+except ImportError:
+    _WATCHDOG_AVAILABLE = False
 
 # ── NSSwitch toggle (macOS 10.15+) ─────────────────────────────────────────────
 # Embeds a real iOS-style toggle switch directly inside a menu item view.
@@ -80,6 +86,78 @@ if _NSSWITCH_AVAILABLE:
 
 SCREENSHOT_EXTS  = {".png", ".jpg", ".jpeg"}
 DEBOUNCE_SECONDS = 2.0
+
+# ── Spotlight-based screenshot watcher ─────────────────────────────────────────
+# Uses `mdfind kMDItemIsScreenCapture == 1` which is set by macOS on every
+# screenshot regardless of save location. Requires NO special permissions —
+# no Full Disk Access, no Desktop/Documents approval. Polls every second.
+
+class SpotlightScreenshotWatcher:
+    """Primary watcher: polls mdfind every second. No permissions needed."""
+
+    POLL_INTERVAL = 1.0
+
+    def __init__(self, callback):
+        self._callback = callback
+        self._seen:   set                        = set()
+        self._stop                               = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    # ── public interface (mirrors watchdog Observer) ──────────────────────────
+
+    def start(self):
+        initial = self._mdfind()
+        self._seen.update(initial)
+        log(f"Spotlight watcher: seeded with {len(initial)} existing screenshot(s)")
+        self._stop.clear()
+        self._thread = threading.Thread(
+            target=self._loop, daemon=True, name="spotlight-watcher"
+        )
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+
+    def join(self, timeout: float = 2.0):
+        if self._thread:
+            self._thread.join(timeout=timeout)
+            self._thread = None
+
+    def is_alive(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    # ── internals ─────────────────────────────────────────────────────────────
+
+    def _mdfind(self) -> set:
+        try:
+            r = subprocess.run(
+                ["mdfind", "-onlyin", os.path.expanduser("~"),
+                 "kMDItemIsScreenCapture == 1"],
+                capture_output=True, text=True, timeout=3
+            )
+            return {p.strip() for p in r.stdout.strip().split("\n") if p.strip()}
+        except Exception:
+            return set()
+
+    def _loop(self):
+        log("Spotlight watcher active — no Full Disk Access required")
+        while not self._stop.wait(self.POLL_INTERVAL):
+            try:
+                current   = self._mdfind()
+                new_paths = current - self._seen
+                self._seen.update(new_paths)
+                for path in sorted(new_paths):
+                    if not is_real_screenshot(path):
+                        continue
+                    try:
+                        age = time.time() - os.path.getmtime(path)
+                    except OSError:
+                        continue
+                    if age < 15:   # only fire for screenshots taken < 15 s ago
+                        log(f"📸 Spotlight detected: {os.path.basename(path)}")
+                        self._callback(path)
+            except Exception as e:
+                log(f"Spotlight watcher error: {e}")
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -369,7 +447,7 @@ class ScreenshotToAIApp(rumps.App):
     def __init__(self):
         super().__init__(name="ScreenshotToAI", title="📸", quit_button="Quit")
         self.enabled  = True
-        self.observer = None
+        self._watcher = None   # SpotlightScreenshotWatcher or watchdog Observer
 
         # Pinned target: set explicitly via "Choose Target" menu.
         # When set, ALL screenshots go here regardless of active tab.
@@ -680,26 +758,45 @@ class ScreenshotToAIApp(rumps.App):
     # ── Watcher ───────────────────────────────────────────────────────────────
 
     def _start_watcher(self):
-        if self.observer and self.observer.is_alive():
+        if self._watcher and self._watcher.is_alive():
             return
-        handler  = ScreenshotHandler(self)
-        self.observer = Observer()
+
+        # ── Primary: Spotlight via mdfind (no permissions needed) ─────────────
+        try:
+            test = subprocess.run(
+                ["mdfind", "-onlyin", os.path.expanduser("~"),
+                 "kMDItemIsScreenCapture == 1"],
+                capture_output=True, text=True, timeout=3
+            )
+            if test.returncode == 0:
+                self._watcher = SpotlightScreenshotWatcher(self.handle_new_screenshot)
+                self._watcher.start()
+                return
+        except Exception as e:
+            log(f"Spotlight unavailable ({e}), falling back to watchdog")
+
+        # ── Fallback: watchdog (needs Full Disk Access) ────────────────────────
+        if not _WATCHDOG_AVAILABLE:
+            log("❌ Neither Spotlight nor watchdog available")
+            return
+
+        handler = ScreenshotHandler(self)
+        watcher = Observer()
         watched_any = False
         for d in get_screenshot_dirs():
             try:
-                self.observer.schedule(handler, d, recursive=False)
-                log(f"Watching: {d}")
+                watcher.schedule(handler, d, recursive=False)
+                log(f"Watching (watchdog): {d}")
                 watched_any = True
             except PermissionError:
-                log(f"⚠️  Permission denied watching {d} — Full Disk Access needed")
+                log(f"⚠️  Permission denied watching {d}")
 
         if not watched_any:
-            log("❌ No directories could be watched — opening Full Disk Access settings")
+            log("❌ No directories watchable — Full Disk Access needed")
             self._notify(
                 "Full Disk Access needed ⚠️",
-                "Opening System Settings → grant ScreenshotToAI Full Disk Access, then relaunch."
+                "Opening System Settings → grant access, then relaunch."
             )
-            # Open System Settings directly to Full Disk Access
             subprocess.run(
                 ["open",
                  "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"],
@@ -707,13 +804,14 @@ class ScreenshotToAIApp(rumps.App):
             )
             return
 
-        self.observer.start()
+        watcher.start()
+        self._watcher = watcher
 
     def _stop_watcher(self):
-        if self.observer:
-            self.observer.stop()
-            self.observer.join()
-            self.observer = None
+        if self._watcher:
+            self._watcher.stop()
+            self._watcher.join()
+            self._watcher = None
 
     # ── Core logic ────────────────────────────────────────────────────────────
 

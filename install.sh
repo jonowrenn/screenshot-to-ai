@@ -85,28 +85,83 @@ mkdir -p "$APP_DIR/Contents/Resources"
 # Bundle app source
 cp "$SRC_DIR/app.py" "$APP_DIR/Contents/Resources/app.py"
 
-# ── Launcher script (printf avoids heredoc quote-escaping issues) ─────────────
-# Do NOT use exec — see comment below.
+# ── Launcher binary ───────────────────────────────────────────────────────────
+# A compiled C binary is the CFBundleExecutable. This is critical for two reasons:
+#  1. macOS only respects LSUIElement=true for compiled Mach-O binaries, not shell
+#     scripts — a shell script launcher causes Python Launcher to flash on every open.
+#  2. The binary fork+exec's python3 (not exec), so the compiled binary stays alive
+#     as the registered app process. Python Launcher is only triggered when python3
+#     is the *main* process of a .app bundle, not when it's a child of a real binary.
 LAUNCHER_PATH="$APP_DIR/Contents/MacOS/$APP_NAME"
-printf '#!/bin/bash\n'                                                                    > "$LAUNCHER_PATH"
-printf 'LOG="$HOME/Library/Logs/screenshot-to-ai.log"\n'                                >> "$LAUNCHER_PATH"
-printf 'mkdir -p "$(dirname "$LOG")"\n'                                                  >> "$LAUNCHER_PATH"
-printf 'RESOURCES="$(cd "$(dirname "$0")/../Resources" && pwd)"\n'                       >> "$LAUNCHER_PATH"
-printf 'echo "=== [$(date)] launcher starting ===" >> "$LOG"\n'                         >> "$LAUNCHER_PATH"
-# Quick import check — show a notification if packages are missing
-printf 'if ! %s -c "import rumps, watchdog" >> "$LOG" 2>&1; then\n' "$PYTHON"           >> "$LAUNCHER_PATH"
-printf '  osascript -e "display notification \"Re-run the installer to fix.\" with title \"Screenshot to AI: missing packages\"" 2>/dev/null\n' >> "$LAUNCHER_PATH"
-printf '  echo "FATAL: packages missing for %s" >> "$LOG"\n' "$PYTHON"                  >> "$LAUNCHER_PATH"
-printf '  exit 1\n'                                                                      >> "$LAUNCHER_PATH"
-printf 'fi\n'                                                                            >> "$LAUNCHER_PATH"
-# Run the app — NOT exec so the shell stays alive as the bundle owner and
-# macOS respects LSUIElement=true (exec would hand ownership to Python Launcher)
-printf '%s "$RESOURCES/app.py" >> "$LOG" 2>&1\n' "$PYTHON"                              >> "$LAUNCHER_PATH"
-printf '_ec=$?\n'                                                                        >> "$LAUNCHER_PATH"
-printf 'echo "=== [$(date)] launcher exited $_ec ===" >> "$LOG"\n'                      >> "$LAUNCHER_PATH"
-printf 'if [ $_ec -ne 0 ]; then\n'                                                       >> "$LAUNCHER_PATH"
-printf '  osascript -e "display notification \"Check ~/Library/Logs/screenshot-to-ai.log\" with title \"Screenshot to AI crashed\"" 2>/dev/null\n' >> "$LAUNCHER_PATH"
-printf 'fi\n'                                                                            >> "$LAUNCHER_PATH"
+LAUNCHER_C="/tmp/screenshot-ai-launcher-$$.c"
+
+cat > "$LAUNCHER_C" << 'CSRC'
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <mach-o/dyld.h>
+
+int main(void) {
+    /* ── locate app.py: .../Contents/MacOS/<binary> → .../Contents/Resources/app.py */
+    char exe[4096] = {0};
+    uint32_t sz = (uint32_t)sizeof(exe);
+    if (_NSGetExecutablePath(exe, &sz) != 0) return 1;
+    char *sl = strrchr(exe, '/');
+    if (!sl) return 1;
+    *sl = '\0';
+    char app_py[4096];
+    snprintf(app_py, sizeof(app_py), "%s/../Resources/app.py", exe);
+
+    /* ── log file ── */
+    const char *home = getenv("HOME");
+    if (!home) home = "/tmp";
+    char logdir[4096], logpath[4096];
+    snprintf(logdir,  sizeof(logdir),  "%s/Library/Logs", home);
+    snprintf(logpath, sizeof(logpath), "%s/Library/Logs/screenshot-to-ai.log", home);
+    mkdir(logdir, 0755);
+
+    /* ── fork: parent waits, child exec's python3 ── */
+    pid_t pid = fork();
+    if (pid < 0) return 1;
+    if (pid == 0) {
+        /* child: redirect stdout+stderr → log, then exec python3 */
+        int fd = open(logpath, O_WRONLY|O_CREAT|O_APPEND, 0644);
+        if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); close(fd); }
+        execl("__PYTHON__", "python3", app_py, (char *)NULL);
+        _exit(1);
+    }
+    /* parent waits so the compiled binary stays alive as the .app process */
+    int status = 0;
+    waitpid(pid, &status, 0);
+    return WEXITSTATUS(status);
+}
+CSRC
+
+# Substitute the detected Python path into the C source
+sed -i '' "s|__PYTHON__|$PYTHON|g" "$LAUNCHER_C"
+
+COMPILED=0
+if command -v cc &>/dev/null; then
+  if cc "$LAUNCHER_C" -o "$LAUNCHER_PATH" 2>/dev/null; then
+    COMPILED=1
+    echo "    ✅ Native launcher compiled (Python Launcher will not appear)"
+  fi
+fi
+rm -f "$LAUNCHER_C"
+
+if [ "$COMPILED" -eq 0 ]; then
+  # Fallback: shell script launcher (Python Launcher may briefly flash on open)
+  echo "    ⚠️  cc not found — using shell script launcher"
+  printf '#!/bin/bash\n'                                                         > "$LAUNCHER_PATH"
+  printf 'LOG="$HOME/Library/Logs/screenshot-to-ai.log"\n'                     >> "$LAUNCHER_PATH"
+  printf 'mkdir -p "$(dirname "$LOG")"\n'                                       >> "$LAUNCHER_PATH"
+  printf 'RESOURCES="$(cd "$(dirname "$0")/../Resources" && pwd)"\n'            >> "$LAUNCHER_PATH"
+  printf '%s "$RESOURCES/app.py" >> "$LOG" 2>&1\n' "$PYTHON"                   >> "$LAUNCHER_PATH"
+fi
 chmod +x "$LAUNCHER_PATH"
 
 # ── Info.plist ────────────────────────────────────────────────────────────────
@@ -177,30 +232,13 @@ echo ""
 # ── 6. Clear Gatekeeper quarantine ───────────────────────────────────────────
 xattr -cr "$APP_DIR" 2>/dev/null || true
 
-# ── 7. Grant Full Disk Access before first launch ────────────────────────────
-# macOS blocks folder-watching unless Full Disk Access is granted. We open
-# the settings page now so the user can add the app once, before launching.
-echo "  ▸ One permission required before launch…"
+# ── 7. Done ───────────────────────────────────────────────────────────────────
 echo ""
-echo "  ┌─────────────────────────────────────────────────────────┐"
-echo "  │  System Settings is opening to Full Disk Access.        │"
-echo "  │                                                          │"
-echo "  │  1. Click the  +  button                                │"
-echo "  │  2. Press Cmd+Shift+H to go to your Home folder         │"
-echo "  │  3. Open  Applications  → select  ScreenshotToAI        │"
-echo "  │  4. Toggle it  ON                                        │"
-echo "  │                                                          │"
-echo "  │  Then come back here and double-click the app.          │"
-echo "  └─────────────────────────────────────────────────────────┘"
+echo "  ✅  Done!"
 echo ""
-open "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles" 2>/dev/null || \
-  open "x-apple.systempreferences:com.apple.preference.security" 2>/dev/null || true
-
-# ── 8. Done ───────────────────────────────────────────────────────────────────
-echo "  ✅  Done!  Find the app at:"
-echo "      Home folder → Applications → ScreenshotToAI"
+echo "  Open Finder → your Home folder → Applications → double-click ScreenshotToAI"
+echo "  The 📸 icon will appear in your menu bar — no extra permissions needed."
 echo ""
-echo "  After granting Full Disk Access, double-click the app."
-echo "  The 📸 icon will appear in your menu bar."
-echo "  Click it → 'Start at Login' to make it permanent."
+echo "  First launch: macOS will ask for Accessibility permission — allow it."
+echo "  Then click the 📸 icon → 'Start at Login' to keep it in your menu bar."
 echo ""

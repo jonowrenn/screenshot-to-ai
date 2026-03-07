@@ -76,7 +76,11 @@ cp "$SRC_DIR/app.py" "$APP_DIR/Contents/Resources/app.py"
 LAUNCHER_PATH="$APP_DIR/Contents/MacOS/$APP_NAME"
 printf '#!/bin/bash\n' > "$LAUNCHER_PATH"
 printf 'RESOURCES="$(cd "$(dirname "$0")/../Resources" && pwd)"\n' >> "$LAUNCHER_PATH"
-printf 'exec %s "$RESOURCES/app.py"\n' "$PYTHON" >> "$LAUNCHER_PATH"
+# Do NOT use exec here. exec would replace the shell process with python3,
+# causing macOS to remap the .app process to Python Launcher (which ignores
+# our LSUIElement=true and our icon). By NOT using exec the shell stays alive
+# as the bundle's main process, macOS respects LSUIElement, and our icon shows.
+printf '%s "$RESOURCES/app.py"\n' "$PYTHON" >> "$LAUNCHER_PATH"
 chmod +x "$LAUNCHER_PATH"
 
 # ── Info.plist ────────────────────────────────────────────────────────────────

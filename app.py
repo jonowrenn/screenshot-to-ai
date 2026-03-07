@@ -682,11 +682,31 @@ class ScreenshotToAIApp(rumps.App):
     def _start_watcher(self):
         if self.observer and self.observer.is_alive():
             return
-        handler = ScreenshotHandler(self)
+        handler  = ScreenshotHandler(self)
         self.observer = Observer()
+        watched_any = False
         for d in get_screenshot_dirs():
-            self.observer.schedule(handler, d, recursive=False)
-            log(f"Watching: {d}")
+            try:
+                self.observer.schedule(handler, d, recursive=False)
+                log(f"Watching: {d}")
+                watched_any = True
+            except PermissionError:
+                log(f"⚠️  Permission denied watching {d} — Full Disk Access needed")
+
+        if not watched_any:
+            log("❌ No directories could be watched — opening Full Disk Access settings")
+            self._notify(
+                "Full Disk Access needed ⚠️",
+                "Opening System Settings → grant ScreenshotToAI Full Disk Access, then relaunch."
+            )
+            # Open System Settings directly to Full Disk Access
+            subprocess.run(
+                ["open",
+                 "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"],
+                capture_output=True
+            )
+            return
+
         self.observer.start()
 
     def _stop_watcher(self):

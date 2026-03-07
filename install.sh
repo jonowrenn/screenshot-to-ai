@@ -157,10 +157,14 @@ if [ -f "$ICON_SRC" ] && command -v sips &>/dev/null && command -v iconutil &>/d
 
   if iconutil -c icns "$ICONSET" -o "$APP_DIR/Contents/Resources/AppIcon.icns" 2>/dev/null; then
     echo "    ✅ Icon applied"
-    # lsregister forces Launch Services to re-read the full bundle (icon, plist, etc.)
-    # This is more reliable than 'touch' for making the icon appear immediately.
-    /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister \
-      -f "$APP_DIR" 2>/dev/null || touch "$APP_DIR"
+    # Bust macOS icon cache: unregister the old entry first, then re-register
+    # fresh. On reinstalls macOS aggressively caches the old (missing) icon
+    # and lsregister -f alone isn't enough — you need -u first.
+    LSREG="/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister"
+    "$LSREG" -u "$APP_DIR" 2>/dev/null || true
+    "$LSREG" -f "$APP_DIR" 2>/dev/null || true
+    # Also tell Finder directly to refresh the item
+    osascript -e "tell application \"Finder\" to update item (POSIX file \"$APP_DIR\" as alias)" 2>/dev/null || true
   else
     echo "    ⚠️  Icon conversion failed (app will use default icon)"
   fi
@@ -173,18 +177,30 @@ echo ""
 # ── 6. Clear Gatekeeper quarantine ───────────────────────────────────────────
 xattr -cr "$APP_DIR" 2>/dev/null || true
 
-# ── 7. Done ───────────────────────────────────────────────────────────────────
+# ── 7. Grant Full Disk Access before first launch ────────────────────────────
+# macOS blocks folder-watching unless Full Disk Access is granted. We open
+# the settings page now so the user can add the app once, before launching.
+echo "  ▸ One permission required before launch…"
 echo ""
-echo "  ✅  Done!"
+echo "  ┌─────────────────────────────────────────────────────────┐"
+echo "  │  System Settings is opening to Full Disk Access.        │"
+echo "  │                                                          │"
+echo "  │  1. Click the  +  button                                │"
+echo "  │  2. Press Cmd+Shift+H to go to your Home folder         │"
+echo "  │  3. Open  Applications  → select  ScreenshotToAI        │"
+echo "  │  4. Toggle it  ON                                        │"
+echo "  │                                                          │"
+echo "  │  Then come back here and double-click the app.          │"
+echo "  └─────────────────────────────────────────────────────────┘"
 echo ""
-echo "  Open Finder → your Home folder → Applications → double-click ScreenshotToAI"
+open "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles" 2>/dev/null || \
+  open "x-apple.systempreferences:com.apple.preference.security" 2>/dev/null || true
+
+# ── 8. Done ───────────────────────────────────────────────────────────────────
+echo "  ✅  Done!  Find the app at:"
+echo "      Home folder → Applications → ScreenshotToAI"
 echo ""
-echo "  First launch checklist:"
-echo "    1. macOS will ask for Accessibility permission — allow it."
-echo "    2. Go to System Settings → Privacy & Security → Full Disk Access"
-echo "       and add ScreenshotToAI (required to watch your Screenshots folder)."
-echo "    3. Click the 📸 icon and enable 'Start at Login' to keep it in your menu bar."
-echo ""
-echo "  Tip: to view logs:"
-echo "    tail -f ~/Library/Logs/screenshot-to-ai.log"
+echo "  After granting Full Disk Access, double-click the app."
+echo "  The 📸 icon will appear in your menu bar."
+echo "  Click it → 'Start at Login' to make it permanent."
 echo ""

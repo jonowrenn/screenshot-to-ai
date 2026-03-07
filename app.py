@@ -381,9 +381,9 @@ class ScreenshotToAIApp(rumps.App):
 
         # ── Menu items ────────────────────────────────────────────────────────
         self.toggle_item = rumps.MenuItem("Auto-paste", callback=self.toggle)
-        self.target_item = rumps.MenuItem("🎯 Set target tab", callback=self.set_target)
-        self.pin_item    = rumps.MenuItem("   No target set — auto-detect", callback=self.clear_pin)
-        self.test_item   = rumps.MenuItem("🔁 Paste last screenshot", callback=self.paste_last)
+        self.target_item = rumps.MenuItem("🎯  Set Target Tab", callback=self.set_target)
+        self.pin_item    = rumps.MenuItem("      No target — auto-detect", callback=self.clear_pin)
+        self.test_item   = rumps.MenuItem("↩  Paste Last Screenshot", callback=self.paste_last)
         self.status_item = rumps.MenuItem("Last: —")
         self.status_item.set_callback(None)
 
@@ -401,9 +401,10 @@ class ScreenshotToAIApp(rumps.App):
         # NSSwitch is attached via a short timer AFTER the app finishes launching.
         # Setting the view during __init__ is too early — the NSMenu isn't
         # fully wired up yet and the view gets dropped silently.
-        self._switch_refs = None
-        self._nsswitch    = None
-        self.toggle_item.state = 1   # checkmark fallback until switch attaches
+        self._switch_refs  = None
+        self._nsswitch     = None
+        self._toggle_badge = None
+        self.toggle_item.state = 1   # checkmark fallback until NSSwitch attaches
 
         if _NSSWITCH_AVAILABLE:
             rumps.Timer(self._deferred_attach_switch, 0.4).start()
@@ -417,60 +418,71 @@ class ScreenshotToAIApp(rumps.App):
 
     def _deferred_attach_switch(self, timer):
         """
-        Called ~0.4 s after launch so the NSMenu is fully built.
-        Tries several strategies to locate the underlying NSMenuItem for the
-        'Auto-paste' row so we can call setView_() on it.
+        Called ~0.4 s after launch. Builds a polished toggle row:
+          [Auto-paste label]   [ON/OFF colored pill]   [NSSwitch]
 
-        rumps.MenuItem is a Python wrapper — NOT an NSMenuItem subclass —
-        so we have to dig for the real ObjC object via one of:
-          1. toggle_item._menuitem  (rumps stores it here in most versions)
-          2. self._menu._menu.itemWithTitle_()   (NSMenu inside rumps._Menu)
-          3. self._status_item.menu().itemWithTitle_()  (via NSStatusItem)
+        The ON/OFF text gives unambiguous color feedback (green = on, grey = off)
+        independent of the system accent color or dark-mode rendering of NSSwitch.
+        Tries three strategies to locate the underlying NSMenuItem.
         """
         import traceback
         timer.stop()
         try:
-            # ── Build the custom view ──────────────────────────────────────────
-            W, H = 240, 30
+            # ── Outer container view ───────────────────────────────────────────
+            W, H = 260, 38
             view = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, W, H))
 
+            # Main label — "Auto-paste"
             lbl = NSTextField.labelWithString_("Auto-paste")
-            lbl.setFrame_(NSMakeRect(14, 6, 150, 18))
+            lbl.setFrame_(NSMakeRect(16, 12, 126, 16))
             lbl.setFont_(NSFont.menuFontOfSize_(13.0))
             view.addSubview_(lbl)
 
-            sw = NSSwitch.alloc().initWithFrame_(NSMakeRect(168, 4, 51, 22))
+            # Colored ON / OFF micro-badge
+            badge_text  = "ON"  if self.enabled else "OFF"
+            badge_color = NSColor.systemGreenColor() if self.enabled else NSColor.secondaryLabelColor()
+            badge = NSTextField.labelWithString_(badge_text)
+            badge.setFrame_(NSMakeRect(146, 13, 34, 13))
+            badge.setFont_(NSFont.boldSystemFontOfSize_(10.0))
+            badge.setTextColor_(badge_color)
+            view.addSubview_(badge)
+
+            # NSSwitch (macOS 10.15+ blue pill toggle)
+            sw = NSSwitch.alloc().initWithFrame_(NSMakeRect(188, 8, 51, 22))
             sw.setState_(1 if self.enabled else 0)
+            # Try forcing the blue control tint (NSBlueControlTint = 1)
+            try:
+                sw.cell().setControlTint_(1)
+            except Exception:
+                pass
 
             tgt = _SwitchTarget.alloc().init_with_callback(self._on_switch_toggled)
             sw.setTarget_(tgt)
             sw.setAction_(objc.selector(tgt.toggled_, signature=b'v@:@'))
             view.addSubview_(sw)
 
-            # ── Find the underlying NSMenuItem ────────────────────────────────
+            # ── Find the underlying NSMenuItem (three strategies) ─────────────
             ns_item = None
 
-            # Strategy 1 — rumps usually stores the NSMenuItem as _menuitem
+            # Strategy 1 — rumps stores the NSMenuItem as _menuitem in most versions
             if hasattr(self.toggle_item, '_menuitem'):
                 ns_item = self.toggle_item._menuitem
                 log(f"NSSwitch: strategy 1 (_menuitem) → {type(ns_item).__name__}")
 
-            # Strategy 2 — dig through rumps' internal _Menu wrapper to its NSMenu
+            # Strategy 2 — rumps._Menu wraps NSMenu at ._menu
             if ns_item is None:
                 try:
-                    ns_menu = self._menu._menu          # rumps._Menu wraps NSMenu here
-                    candidate = ns_menu.itemWithTitle_("Auto-paste")
+                    candidate = self._menu._menu.itemWithTitle_("Auto-paste")
                     if candidate is not None:
                         ns_item = candidate
                         log("NSSwitch: strategy 2 (self._menu._menu.itemWithTitle_) ✓")
                 except Exception as exc:
                     log(f"NSSwitch: strategy 2 failed: {exc}")
 
-            # Strategy 3 — get NSMenu directly from the status bar item
+            # Strategy 3 — via NSStatusItem.menu()
             if ns_item is None:
                 try:
-                    ns_menu = self._status_item.menu()  # NSStatusItem → NSMenu
-                    candidate = ns_menu.itemWithTitle_("Auto-paste")
+                    candidate = self._status_item.menu().itemWithTitle_("Auto-paste")
                     if candidate is not None:
                         ns_item = candidate
                         log("NSSwitch: strategy 3 (_status_item.menu().itemWithTitle_) ✓")
@@ -485,14 +497,27 @@ class ScreenshotToAIApp(rumps.App):
 
             ns_item.setView_(view)
 
-            # Keep ObjC objects alive so Python GC doesn't free them
-            self._switch_refs = tgt
-            self._nsswitch    = sw
+            # Keep ObjC objects alive (Python GC would free them otherwise)
+            self._switch_refs    = tgt
+            self._nsswitch       = sw
+            self._toggle_badge   = badge   # kept for live ON/OFF updates
             log("NSSwitch toggle attached ✅")
 
         except Exception:
             log(f"NSSwitch setup failed (checkmark fallback):\n{traceback.format_exc()}")
             self.toggle_item.state = 1 if self.enabled else 0
+
+    def _update_toggle_badge(self):
+        """Refresh the green ON / grey OFF badge text and color."""
+        badge = getattr(self, "_toggle_badge", None)
+        if badge is None:
+            return
+        if self.enabled:
+            badge.setStringValue_("ON")
+            badge.setTextColor_(NSColor.systemGreenColor())
+        else:
+            badge.setStringValue_("OFF")
+            badge.setTextColor_(NSColor.secondaryLabelColor())
 
     # ── Auto-discover on startup ───────────────────────────────────────────────
 
@@ -517,15 +542,15 @@ class ScreenshotToAIApp(rumps.App):
     def _on_switch_toggled(self, is_on: bool):
         """Called by the NSSwitch when the user flips it."""
         self._apply_toggle(is_on)
+        self._update_toggle_badge()
 
     def toggle(self, sender):
         """Called when the menu item row is clicked (fallback / keyboard nav)."""
         new_state = not self.enabled
-        # Keep the NSSwitch in sync if it exists
         if self._nsswitch is not None:
             self._nsswitch.setState_(1 if new_state else 0)
         self._apply_toggle(new_state)
-        # Update checkmark fallback
+        self._update_toggle_badge()
         if self._nsswitch is None:
             sender.state = 1 if new_state else 0
 
@@ -612,11 +637,11 @@ class ScreenshotToAIApp(rumps.App):
 
     def _update_pin_label(self):
         if self._pinned_tab:
-            self.pin_item.title = f"   📌 {self._pinned_service} pinned  (click to clear)"
+            self.pin_item.title = f"      📌 {self._pinned_service} pinned  (click to clear)"
         elif self._last_tab:
-            self.pin_item.title = f"   🔍 Auto: {self._last_service} (no pin)"
+            self.pin_item.title = f"      🔍 Auto: {self._last_service}"
         else:
-            self.pin_item.title = "   No target set — auto-detect"
+            self.pin_item.title = "      No target — auto-detect"
 
     # ── Manual retry ──────────────────────────────────────────────────────────
 

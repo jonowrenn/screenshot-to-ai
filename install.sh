@@ -124,8 +124,10 @@ xattr -cr "$APP_DIR" 2>/dev/null || true
 # ── 5. Optional: copy to /Applications ───────────────────────────────────────
 echo "  The app is in ~/Applications."
 echo ""
-# Read from /dev/tty so this works even when script is piped via curl | bash
-if read -r -p "  Also copy to /Applications (system-wide)? [y/N] " _choice </dev/tty 2>/dev/null; then
+# Print prompt explicitly first — read -p doesn't show the prompt when </dev/tty
+# is redirected on macOS bash (curl | bash scenario).
+printf "  Also copy to /Applications (system-wide)? [y/N] "
+if read -r _choice </dev/tty 2>/dev/null; then
   case "$_choice" in
     [Yy]*)
       sudo cp -R "$APP_DIR" /Applications/

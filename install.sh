@@ -194,7 +194,11 @@ cat > "$PLIST_PATH" << INFOPLIST
   <string>10.15</string>
   <key>LSUIElement</key>
   <true/>
+  <key>LSBackgroundOnly</key>
+  <false/>
   <key>NSHighResolutionCapable</key>
+  <true/>
+  <key>NSSupportsAutomaticGraphicsSwitching</key>
   <true/>
 </dict>
 </plist>

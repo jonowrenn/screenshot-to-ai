@@ -905,5 +905,18 @@ class ScreenshotToAIApp(rumps.App):
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    # Suppress Dock icon before the run loop starts.
+    # When launched via a .app bundle the shell script spawns python3, which
+    # macOS associates with "Python Launcher" and shows it in the Dock.
+    # Setting NSApplicationActivationPolicyAccessory here (before rumps calls
+    # it) prevents that bounce entirely.
+    try:
+        from AppKit import NSApplication, NSApplicationActivationPolicyAccessory
+        NSApplication.sharedApplication().setActivationPolicy_(
+            NSApplicationActivationPolicyAccessory
+        )
+    except Exception:
+        pass
+
     log("Starting…")
     ScreenshotToAIApp().run()

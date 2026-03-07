@@ -91,18 +91,28 @@ INFOPLIST
 # ── App icon (.icns from icon.png) ────────────────────────────────────────────
 ICON_SRC="$SRC_DIR/icon.png"
 if [ -f "$ICON_SRC" ] && command -v sips &>/dev/null && command -v iconutil &>/dev/null; then
-  ICONSET="$TMPDIR/AppIcon.iconset"
-  rm -rf "$ICONSET" && mkdir -p "$ICONSET"
+  # Use mktemp so the temp dir is always clean and $TMPDIR trailing-slash issues
+  # (common on macOS) can't corrupt the iconset path.
+  ICONSET_PARENT="$(mktemp -d)"
+  ICONSET="$ICONSET_PARENT/AppIcon.iconset"
+  mkdir -p "$ICONSET"
 
-  for sz in 16 32 64 128 256 512; do
+  # Standard Apple iconset sizes — 64 is NOT a valid size; iconutil ignores it.
+  for sz in 16 32 128 256 512; do
     sips -z $sz $sz "$ICON_SRC" --out "$ICONSET/icon_${sz}x${sz}.png"      &>/dev/null
     sz2=$((sz * 2))
     sips -z $sz2 $sz2 "$ICON_SRC" --out "$ICONSET/icon_${sz}x${sz}@2x.png" &>/dev/null
   done
 
-  iconutil -c icns "$ICONSET" -o "$APP_DIR/Contents/Resources/AppIcon.icns" 2>/dev/null \
-    && echo "    ✅ Icon applied" || echo "    ⚠️  Icon conversion failed (app will use default icon)"
-  rm -rf "$ICONSET"
+  if iconutil -c icns "$ICONSET" -o "$APP_DIR/Contents/Resources/AppIcon.icns" 2>/dev/null; then
+    echo "    ✅ Icon applied"
+    # Tell Finder and Dock to pick up the new icon immediately
+    touch "$APP_DIR"
+    killall Dock 2>/dev/null || true
+  else
+    echo "    ⚠️  Icon conversion failed (app will use default icon)"
+  fi
+  rm -rf "$ICONSET_PARENT"
 fi
 
 echo "    ✅ $APP_NAME.app built → $APP_DIR"
@@ -120,7 +130,9 @@ if read -r -p "  Also copy to /Applications (system-wide)? [y/N] " _choice </dev
     [Yy]*)
       sudo cp -R "$APP_DIR" /Applications/
       sudo xattr -cr "/Applications/$APP_NAME.app" 2>/dev/null || true
+      sudo touch "/Applications/$APP_NAME.app" 2>/dev/null || true
       echo "    ✅ Copied to /Applications/$APP_NAME.app"
+      killall Dock 2>/dev/null || true
       ;;
   esac
 fi

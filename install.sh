@@ -53,8 +53,21 @@ echo ""
 echo "  ▸ Installing Python packages…"
 "$PYTHON" -m pip install rumps watchdog pyobjc-core pyobjc-framework-Cocoa \
     --quiet --break-system-packages 2>/dev/null \
+  || "$PYTHON" -m pip install rumps watchdog pyobjc-core pyobjc-framework-Cocoa \
+    --user --quiet 2>/dev/null \
   || "$PYTHON" -m pip install rumps watchdog pyobjc-core pyobjc-framework-Cocoa --quiet
-echo "    ✅ Python packages ready"
+
+# Verify the packages are actually importable with this Python
+if ! "$PYTHON" -c "import rumps, watchdog" 2>/dev/null; then
+  echo "    ❌ Package import failed. Trying --user install…"
+  "$PYTHON" -m pip install rumps watchdog pyobjc-core pyobjc-framework-Cocoa --user 2>/dev/null
+  if ! "$PYTHON" -c "import rumps, watchdog" 2>/dev/null; then
+    echo "    ❌ Could not install packages for $PYTHON"
+    echo "       Try: $PYTHON -m pip install rumps watchdog pyobjc-core pyobjc-framework-Cocoa"
+    exit 1
+  fi
+fi
+echo "    ✅ Python packages ready ($PYTHON)"
 echo ""
 
 # ── 4. Stop any running instance before replacing files ───────────────────────
@@ -73,14 +86,27 @@ mkdir -p "$APP_DIR/Contents/Resources"
 cp "$SRC_DIR/app.py" "$APP_DIR/Contents/Resources/app.py"
 
 # ── Launcher script (printf avoids heredoc quote-escaping issues) ─────────────
+# Do NOT use exec — see comment below.
 LAUNCHER_PATH="$APP_DIR/Contents/MacOS/$APP_NAME"
-printf '#!/bin/bash\n' > "$LAUNCHER_PATH"
-printf 'RESOURCES="$(cd "$(dirname "$0")/../Resources" && pwd)"\n' >> "$LAUNCHER_PATH"
-# Do NOT use exec here. exec would replace the shell process with python3,
-# causing macOS to remap the .app process to Python Launcher (which ignores
-# our LSUIElement=true and our icon). By NOT using exec the shell stays alive
-# as the bundle's main process, macOS respects LSUIElement, and our icon shows.
-printf '%s "$RESOURCES/app.py"\n' "$PYTHON" >> "$LAUNCHER_PATH"
+printf '#!/bin/bash\n'                                                                    > "$LAUNCHER_PATH"
+printf 'LOG="$HOME/Library/Logs/screenshot-to-ai.log"\n'                                >> "$LAUNCHER_PATH"
+printf 'mkdir -p "$(dirname "$LOG")"\n'                                                  >> "$LAUNCHER_PATH"
+printf 'RESOURCES="$(cd "$(dirname "$0")/../Resources" && pwd)"\n'                       >> "$LAUNCHER_PATH"
+printf 'echo "=== [$(date)] launcher starting ===" >> "$LOG"\n'                         >> "$LAUNCHER_PATH"
+# Quick import check — show a notification if packages are missing
+printf 'if ! %s -c "import rumps, watchdog" >> "$LOG" 2>&1; then\n' "$PYTHON"           >> "$LAUNCHER_PATH"
+printf '  osascript -e "display notification \"Re-run the installer to fix.\" with title \"Screenshot to AI: missing packages\"" 2>/dev/null\n' >> "$LAUNCHER_PATH"
+printf '  echo "FATAL: packages missing for %s" >> "$LOG"\n' "$PYTHON"                  >> "$LAUNCHER_PATH"
+printf '  exit 1\n'                                                                      >> "$LAUNCHER_PATH"
+printf 'fi\n'                                                                            >> "$LAUNCHER_PATH"
+# Run the app — NOT exec so the shell stays alive as the bundle owner and
+# macOS respects LSUIElement=true (exec would hand ownership to Python Launcher)
+printf '%s "$RESOURCES/app.py" >> "$LOG" 2>&1\n' "$PYTHON"                              >> "$LAUNCHER_PATH"
+printf '_ec=$?\n'                                                                        >> "$LAUNCHER_PATH"
+printf 'echo "=== [$(date)] launcher exited $_ec ===" >> "$LOG"\n'                      >> "$LAUNCHER_PATH"
+printf 'if [ $_ec -ne 0 ]; then\n'                                                       >> "$LAUNCHER_PATH"
+printf '  osascript -e "display notification \"Check ~/Library/Logs/screenshot-to-ai.log\" with title \"Screenshot to AI crashed\"" 2>/dev/null\n' >> "$LAUNCHER_PATH"
+printf 'fi\n'                                                                            >> "$LAUNCHER_PATH"
 chmod +x "$LAUNCHER_PATH"
 
 # ── Info.plist ────────────────────────────────────────────────────────────────
@@ -131,8 +157,10 @@ if [ -f "$ICON_SRC" ] && command -v sips &>/dev/null && command -v iconutil &>/d
 
   if iconutil -c icns "$ICONSET" -o "$APP_DIR/Contents/Resources/AppIcon.icns" 2>/dev/null; then
     echo "    ✅ Icon applied"
-    # Touch the bundle so Finder re-reads it — no Dock restart needed
-    touch "$APP_DIR"
+    # lsregister forces Launch Services to re-read the full bundle (icon, plist, etc.)
+    # This is more reliable than 'touch' for making the icon appear immediately.
+    /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister \
+      -f "$APP_DIR" 2>/dev/null || touch "$APP_DIR"
   else
     echo "    ⚠️  Icon conversion failed (app will use default icon)"
   fi

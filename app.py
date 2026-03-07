@@ -418,12 +418,19 @@ class ScreenshotToAIApp(rumps.App):
     def _deferred_attach_switch(self, timer):
         """
         Called ~0.4 s after launch so the NSMenu is fully built.
-        Calls setView_() directly on self.toggle_item (which IS an NSMenuItem
-        subclass) — more reliable than searching by title through self._menu.
+        Tries several strategies to locate the underlying NSMenuItem for the
+        'Auto-paste' row so we can call setView_() on it.
+
+        rumps.MenuItem is a Python wrapper — NOT an NSMenuItem subclass —
+        so we have to dig for the real ObjC object via one of:
+          1. toggle_item._menuitem  (rumps stores it here in most versions)
+          2. self._menu._menu.itemWithTitle_()   (NSMenu inside rumps._Menu)
+          3. self._status_item.menu().itemWithTitle_()  (via NSStatusItem)
         """
         import traceback
         timer.stop()
         try:
+            # ── Build the custom view ──────────────────────────────────────────
             W, H = 240, 30
             view = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, W, H))
 
@@ -440,11 +447,45 @@ class ScreenshotToAIApp(rumps.App):
             sw.setAction_(objc.selector(tgt.toggled_, signature=b'v@:@'))
             view.addSubview_(sw)
 
-            # toggle_item is a rumps.MenuItem which subclasses NSMenuItem directly —
-            # calling setView_() on it is more direct and reliable than itemWithTitle_()
-            self.toggle_item.setView_(view)
+            # ── Find the underlying NSMenuItem ────────────────────────────────
+            ns_item = None
 
-            # Keep ObjC objects alive (Python GC would free them otherwise)
+            # Strategy 1 — rumps usually stores the NSMenuItem as _menuitem
+            if hasattr(self.toggle_item, '_menuitem'):
+                ns_item = self.toggle_item._menuitem
+                log(f"NSSwitch: strategy 1 (_menuitem) → {type(ns_item).__name__}")
+
+            # Strategy 2 — dig through rumps' internal _Menu wrapper to its NSMenu
+            if ns_item is None:
+                try:
+                    ns_menu = self._menu._menu          # rumps._Menu wraps NSMenu here
+                    candidate = ns_menu.itemWithTitle_("Auto-paste")
+                    if candidate is not None:
+                        ns_item = candidate
+                        log("NSSwitch: strategy 2 (self._menu._menu.itemWithTitle_) ✓")
+                except Exception as exc:
+                    log(f"NSSwitch: strategy 2 failed: {exc}")
+
+            # Strategy 3 — get NSMenu directly from the status bar item
+            if ns_item is None:
+                try:
+                    ns_menu = self._status_item.menu()  # NSStatusItem → NSMenu
+                    candidate = ns_menu.itemWithTitle_("Auto-paste")
+                    if candidate is not None:
+                        ns_item = candidate
+                        log("NSSwitch: strategy 3 (_status_item.menu().itemWithTitle_) ✓")
+                except Exception as exc:
+                    log(f"NSSwitch: strategy 3 failed: {exc}")
+
+            if ns_item is None:
+                attrs = [a for a in dir(self.toggle_item) if not a.startswith("__")]
+                log(f"NSSwitch: all strategies failed — toggle_item attrs: {attrs}")
+                self.toggle_item.state = 1 if self.enabled else 0
+                return
+
+            ns_item.setView_(view)
+
+            # Keep ObjC objects alive so Python GC doesn't free them
             self._switch_refs = tgt
             self._nsswitch    = sw
             log("NSSwitch toggle attached ✅")

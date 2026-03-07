@@ -6,6 +6,7 @@ into your open Claude.ai or ChatGPT Chrome tab.
 """
 
 import os
+import sys
 import time
 import threading
 import subprocess
@@ -386,6 +387,8 @@ class ScreenshotToAIApp(rumps.App):
         self.test_item   = rumps.MenuItem("↩  Paste Last Screenshot", callback=self.paste_last)
         self.status_item = rumps.MenuItem("Last: —")
         self.status_item.set_callback(None)
+        self.login_item  = rumps.MenuItem("Start at Login", callback=self.toggle_login_item)
+        self.login_item.state = 1 if self._is_agent_installed() else 0
 
         self.menu = [
             self.toggle_item,
@@ -396,6 +399,8 @@ class ScreenshotToAIApp(rumps.App):
             self.test_item,
             None,
             self.status_item,
+            None,
+            self.login_item,
         ]
 
         # NSSwitch is attached via a short timer AFTER the app finishes launching.
@@ -801,6 +806,95 @@ class ScreenshotToAIApp(rumps.App):
             log(f"  ❌ Exception: {e}")
             self._notify("Error ❌", str(e))
             self._set_status(f"❌  {e}")
+
+    # ── Start at Login (Launch Agent) ─────────────────────────────────────────
+
+    _AGENT_LABEL = "com.screenshot-to-ai"
+    _AGENT_PLIST = os.path.expanduser(
+        "~/Library/LaunchAgents/com.screenshot-to-ai.plist"
+    )
+
+    def _is_agent_installed(self) -> bool:
+        return os.path.exists(self._AGENT_PLIST)
+
+    def _install_launch_agent(self):
+        """Write the launchd plist and load it so the app auto-starts on login."""
+        python  = sys.executable
+        script  = os.path.abspath(__file__)
+        log     = os.path.expanduser("~/Library/Logs/screenshot-to-ai.log")
+
+        os.makedirs(os.path.dirname(self._AGENT_PLIST), exist_ok=True)
+        os.makedirs(os.path.dirname(log), exist_ok=True)
+
+        plist = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{self._AGENT_LABEL}</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>{python}</string>
+        <string>{script}</string>
+    </array>
+
+    <!-- Start automatically at every login -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Restart if it crashes, but NOT if the user quits cleanly -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>{log}</string>
+    <key>StandardErrorPath</key>
+    <string>{log}</string>
+</dict>
+</plist>
+"""
+        with open(self._AGENT_PLIST, "w") as f:
+            f.write(plist)
+
+        # Load immediately (takes effect for this session too)
+        subprocess.run(
+            ["launchctl", "load", self._AGENT_PLIST],
+            capture_output=True
+        )
+        log_msg = f"Launch Agent installed → {self._AGENT_PLIST}"
+        log(log_msg)
+
+    def _uninstall_launch_agent(self):
+        """Unload and remove the launchd plist."""
+        subprocess.run(
+            ["launchctl", "unload", self._AGENT_PLIST],
+            capture_output=True
+        )
+        try:
+            os.remove(self._AGENT_PLIST)
+        except FileNotFoundError:
+            pass
+        log(f"Launch Agent removed")
+
+    def toggle_login_item(self, sender):
+        """Install or remove the Launch Agent when the user clicks 'Start at Login'."""
+        if self._is_agent_installed():
+            self._uninstall_launch_agent()
+            sender.state = 0
+            self._notify("Removed from Login Items",
+                         "The app will no longer start automatically.")
+        else:
+            self._install_launch_agent()
+            sender.state = 1
+            self._notify("Added to Login Items ✅",
+                         "The 📸 icon will appear automatically every time you log in.")
+
+    # ── Notifications / status ─────────────────────────────────────────────────
 
     def _notify(self, subtitle: str, message: str):
         rumps.notification("Screenshot to AI", subtitle, message, sound=False)

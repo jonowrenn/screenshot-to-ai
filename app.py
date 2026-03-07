@@ -326,21 +326,38 @@ class ScreenshotHandler(FileSystemEventHandler):
         super().__init__()
         self.app = app
         self._last_fired: float = 0
+        self._last_path:  str   = ""
 
     def on_created(self, event):
         if not event.is_directory and is_real_screenshot(event.src_path):
-            self._trigger(event.src_path)
+            self._trigger(event.src_path, "created")
 
     def on_moved(self, event):
+        # macOS renames the hidden .Screenshot*.png temp file to the final name.
+        # We only care about the destination and only if it's a real screenshot.
         if not event.is_directory and is_real_screenshot(event.dest_path):
-            self._trigger(event.dest_path)
+            self._trigger(event.dest_path, "moved")
 
-    def _trigger(self, path: str):
+    def on_deleted(self, event):
+        # If the user manually drags the screenshot away from the watch folder,
+        # watchdog fires on_deleted on the source AND on_created on the dest
+        # (if the dest folder is also watched). We just log it here so the
+        # subsequent processing attempt can gracefully handle the missing file.
+        if not event.is_directory and is_real_screenshot(event.src_path):
+            log(f"📸 Deleted/moved away: {os.path.basename(event.src_path)}")
+
+    def _trigger(self, path: str, reason: str):
         now = time.time()
-        if now - self._last_fired < DEBOUNCE_SECONDS:
+        # Deduplicate: same path within debounce window = ignore
+        if path == self._last_path and now - self._last_fired < DEBOUNCE_SECONDS:
+            log(f"  Debounced duplicate ({reason}): {os.path.basename(path)}")
             return
+        # Different path but still within debounce window: allow (rapid back-to-back shots)
+        if path != self._last_path and now - self._last_fired < DEBOUNCE_SECONDS:
+            log(f"  New file during debounce window — processing ({reason}): {os.path.basename(path)}")
         self._last_fired = now
-        log(f"📸 Detected: {os.path.basename(path)}")
+        self._last_path  = path
+        log(f"📸 Detected ({reason}): {os.path.basename(path)}")
         time.sleep(1.0)
         self.app.handle_new_screenshot(path)
 
@@ -401,18 +418,12 @@ class ScreenshotToAIApp(rumps.App):
     def _deferred_attach_switch(self, timer):
         """
         Called ~0.4 s after launch so the NSMenu is fully built.
-        Finds the 'Auto-paste' menu item by title inside the real NSMenu
-        and replaces it with a label + NSSwitch custom view.
+        Calls setView_() directly on self.toggle_item (which IS an NSMenuItem
+        subclass) — more reliable than searching by title through self._menu.
         """
         import traceback
         timer.stop()
         try:
-            # self._menu is the rumps NSMenu subclass — find our item by title
-            item = self._menu.itemWithTitle_("Auto-paste")
-            if item is None:
-                log("NSSwitch setup: item 'Auto-paste' not found in NSMenu")
-                return
-
             W, H = 240, 30
             view = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, W, H))
 
@@ -429,7 +440,9 @@ class ScreenshotToAIApp(rumps.App):
             sw.setAction_(objc.selector(tgt.toggled_, signature=b'v@:@'))
             view.addSubview_(sw)
 
-            item.setView_(view)
+            # toggle_item is a rumps.MenuItem which subclasses NSMenuItem directly —
+            # calling setView_() on it is more direct and reliable than itemWithTitle_()
+            self.toggle_item.setView_(view)
 
             # Keep ObjC objects alive (Python GC would free them otherwise)
             self._switch_refs = tgt
@@ -610,6 +623,38 @@ class ScreenshotToAIApp(rumps.App):
         filename = os.path.basename(filepath)
         log(f"Processing: {filename}")
 
+        # ── Edge case: file moved/deleted before we got here ──────────────────
+        # Wait up to 3 s for the file to settle (macOS sometimes renames/moves
+        # the temp file to the final path in the background).
+        deadline = time.time() + 3.0
+        while not os.path.exists(filepath):
+            if time.time() > deadline:
+                log(f"  ❌ File no longer exists (may have been moved): {filename}")
+                self._notify("Screenshot not found ⚠️",
+                             "The file was moved or deleted before it could be pasted.")
+                self._set_status("⚠️  file missing")
+                return
+            time.sleep(0.25)
+
+        # ── Edge case: file size is still 0 (writing in progress) ─────────────
+        deadline2 = time.time() + 3.0
+        while os.path.getsize(filepath) == 0:
+            if time.time() > deadline2:
+                log(f"  ❌ File size still 0 after waiting: {filename}")
+                break
+            time.sleep(0.2)
+
+        # ── Edge case: Chrome not running at all ──────────────────────────────
+        chrome_check, _ = run_applescript(
+            'tell application "System Events" to return (name of processes) contains "Google Chrome"'
+        )
+        if chrome_check.strip().lower() != "true":
+            log("  ❌ Google Chrome is not running")
+            self._notify("Chrome not running ⚠️",
+                         "Open Google Chrome with Claude.ai or ChatGPT to use auto-paste.")
+            self._set_status("⚠️  Chrome not running")
+            return
+
         # Priority 1 — explicitly pinned tab
         tab, used_pin, used_fallback = None, False, False
 
@@ -634,9 +679,18 @@ class ScreenshotToAIApp(rumps.App):
             log("  ❌ No AI tab found")
             self._notify(
                 "No AI tab found ⚠️",
-                "Open Claude.ai or ChatGPT in Chrome, or use 🎯 Choose target tab."
+                "Open Claude.ai or ChatGPT in Chrome, or use 🎯 Set target tab."
             )
             self._set_status("⚠️  No AI tab found")
+            return
+
+        # ── Edge case: file was moved/renamed between detection and now ───────
+        # Re-check existence right before the paste attempt.
+        if not os.path.exists(filepath):
+            log(f"  ❌ File disappeared just before paste: {filename}")
+            self._notify("Screenshot vanished ⚠️",
+                         "The file was moved or deleted just before pasting.")
+            self._set_status("⚠️  file disappeared")
             return
 
         url  = get_tab_url(tab[0], tab[1])

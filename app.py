@@ -1023,11 +1023,29 @@ class ScreenshotToAIApp(rumps.App):
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    # Suppress Dock icon before the run loop starts.
-    # When launched via a .app bundle the shell script spawns python3, which
-    # macOS associates with "Python Launcher" and shows it in the Dock.
-    # Setting NSApplicationActivationPolicyAccessory here (before rumps calls
-    # it) prevents that bounce entirely.
+    import fcntl
+
+    # ── Single-instance lock ───────────────────────────────────────────────────
+    # Prevents duplicate 📸 icons when the app is opened more than once.
+    # The lock file is held for the lifetime of the process and automatically
+    # released (even on crash) when the process exits.
+    _LOCK_DIR  = os.path.expanduser("~/Library/Application Support/screenshot-to-ai")
+    _LOCK_PATH = os.path.join(_LOCK_DIR, "app.lock")
+    os.makedirs(_LOCK_DIR, exist_ok=True)
+    _lock_fh = open(_LOCK_PATH, "w")
+    try:
+        fcntl.flock(_lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except IOError:
+        # Another instance is already running — surface it and exit quietly.
+        subprocess.run(
+            ["osascript", "-e",
+             'display notification "Already running — look for 📸 in your menu bar." '
+             'with title "Screenshot to AI"'],
+            capture_output=True
+        )
+        sys.exit(0)
+
+    # ── Suppress Dock icon ─────────────────────────────────────────────────────
     try:
         from AppKit import NSApplication, NSApplicationActivationPolicyAccessory
         NSApplication.sharedApplication().setActivationPolicy_(

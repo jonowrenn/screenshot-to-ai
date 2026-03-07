@@ -71,7 +71,11 @@ echo "    ✅ Python packages ready ($PYTHON)"
 echo ""
 
 # ── 4. Stop any running instance before replacing files ───────────────────────
-pkill -f "app.py" 2>/dev/null || true
+# Note: pkill is intentionally NOT used here — macOS Sequoia's App Management
+# blocks it and shows a scary "Terminal was prevented from modifying apps" banner.
+# The installer replaces files in place; any running old instance will keep
+# working until the user relaunches the new version.
+osascript -e 'quit app "ScreenshotToAI"' 2>/dev/null || true
 sleep 0.5
 
 # ── 5. Build .app bundle ──────────────────────────────────────────────────────
@@ -198,33 +202,43 @@ INFOPLIST
 
 # ── App icon (.icns from icon.png) ────────────────────────────────────────────
 ICON_SRC="$SRC_DIR/icon.png"
+ICON_OK=0
 if [ -f "$ICON_SRC" ] && command -v sips &>/dev/null && command -v iconutil &>/dev/null; then
   ICONSET_PARENT="$(mktemp -d)"
   ICONSET="$ICONSET_PARENT/AppIcon.iconset"
   mkdir -p "$ICONSET"
 
-  # Standard Apple iconset sizes (64 is not a valid size — iconutil rejects it)
+  SIPS_OK=1
   for sz in 16 32 128 256 512; do
-    sips -z $sz $sz "$ICON_SRC" --out "$ICONSET/icon_${sz}x${sz}.png"      &>/dev/null
+    sips -z $sz $sz "$ICON_SRC" --out "$ICONSET/icon_${sz}x${sz}.png" &>/dev/null || SIPS_OK=0
     sz2=$((sz * 2))
-    sips -z $sz2 $sz2 "$ICON_SRC" --out "$ICONSET/icon_${sz}x${sz}@2x.png" &>/dev/null
+    sips -z $sz2 $sz2 "$ICON_SRC" --out "$ICONSET/icon_${sz}x${sz}@2x.png" &>/dev/null || SIPS_OK=0
   done
 
-  if iconutil -c icns "$ICONSET" -o "$APP_DIR/Contents/Resources/AppIcon.icns" 2>/dev/null; then
+  ICONUTIL_ERR="$(iconutil -c icns "$ICONSET" -o "$APP_DIR/Contents/Resources/AppIcon.icns" 2>&1)"
+  if [ -z "$ICONUTIL_ERR" ] && [ -f "$APP_DIR/Contents/Resources/AppIcon.icns" ]; then
+    ICON_OK=1
     echo "    ✅ Icon applied"
-    # Bust macOS icon cache: unregister the old entry first, then re-register
-    # fresh. On reinstalls macOS aggressively caches the old (missing) icon
-    # and lsregister -f alone isn't enough — you need -u first.
-    LSREG="/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister"
-    "$LSREG" -u "$APP_DIR" 2>/dev/null || true
-    "$LSREG" -f "$APP_DIR" 2>/dev/null || true
-    # Also tell Finder directly to refresh the item
-    osascript -e "tell application \"Finder\" to update item (POSIX file \"$APP_DIR\" as alias)" 2>/dev/null || true
   else
-    echo "    ⚠️  Icon conversion failed (app will use default icon)"
+    [ -n "$ICONUTIL_ERR" ] && echo "    ⚠️  iconutil: $ICONUTIL_ERR"
+    [ "$SIPS_OK" -eq 0 ] && echo "    ⚠️  sips resize had errors"
+    # Fallback: copy the PNG directly — macOS will use it as-is
+    cp "$ICON_SRC" "$APP_DIR/Contents/Resources/AppIcon.png" 2>/dev/null && ICON_OK=1 \
+      && echo "    ✅ Icon applied (PNG fallback)"
   fi
   rm -rf "$ICONSET_PARENT"
+elif [ -f "$ICON_SRC" ]; then
+  # sips/iconutil not available — copy PNG directly
+  cp "$ICON_SRC" "$APP_DIR/Contents/Resources/AppIcon.png" 2>/dev/null && ICON_OK=1 \
+    && echo "    ✅ Icon applied (PNG fallback)"
 fi
+[ "$ICON_OK" -eq 0 ] && echo "    ⚠️  Icon could not be applied (app will use default icon)"
+
+# Bust macOS icon cache so the new icon shows immediately
+LSREG="/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister"
+"$LSREG" -u "$APP_DIR" 2>/dev/null || true
+"$LSREG" -f "$APP_DIR" 2>/dev/null || true
+osascript -e "tell application \"Finder\" to update item (POSIX file \"$APP_DIR\" as alias)" 2>/dev/null || true
 
 echo "    ✅ $APP_NAME.app built → $APP_DIR"
 echo ""

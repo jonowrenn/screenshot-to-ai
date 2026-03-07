@@ -20,28 +20,9 @@ echo "  📸  Screenshot to AI — Installer"
 echo "  ──────────────────────────────────"
 echo ""
 
-# ── 1. Download source ────────────────────────────────────────────────────────
-echo "  ▸ Downloading latest source…"
-rm -rf "$SRC_DIR"
-mkdir -p "$SRC_DIR"
-curl -fsSL "https://github.com/$REPO/archive/$BRANCH.tar.gz" \
-  | tar -xz -C "$SRC_DIR" --strip-components=1
-echo "    ✅ Source downloaded"
-echo ""
-
-# ── 2. Install Python dependencies ───────────────────────────────────────────
-echo "  ▸ Installing Python packages…"
-pip3 install rumps watchdog pyobjc-core pyobjc-framework-Cocoa \
-    --quiet --break-system-packages 2>/dev/null \
-  || pip3 install rumps watchdog pyobjc-core pyobjc-framework-Cocoa --quiet
-echo "    ✅ Python packages ready"
-echo ""
-
-# ── 3. Build .app bundle ──────────────────────────────────────────────────────
-echo "  ▸ Building $APP_NAME.app…"
-
-# Prefer system / Homebrew Python over any IDE-bundled python3 (PyCharm, etc.)
-# which PyCharm registers on PATH and whose invocation causes PyCharm to open.
+# ── 1. Detect Python (must happen first so pip uses the same interpreter) ─────
+# Prefer system / Homebrew Python over any IDE-bundled python3.
+# PyCharm registers its own python3 on PATH; using it causes PyCharm to open.
 PYTHON=""
 for candidate in \
     /usr/bin/python3 \
@@ -58,6 +39,31 @@ if [ -z "$PYTHON" ]; then
   echo "  ❌ Python 3 not found. Install it from https://www.python.org and re-run."
   exit 1
 fi
+
+# ── 2. Download source ────────────────────────────────────────────────────────
+echo "  ▸ Downloading latest source…"
+rm -rf "$SRC_DIR"
+mkdir -p "$SRC_DIR"
+curl -fsSL "https://github.com/$REPO/archive/$BRANCH.tar.gz" \
+  | tar -xz -C "$SRC_DIR" --strip-components=1
+echo "    ✅ Source downloaded"
+echo ""
+
+# ── 3. Install Python dependencies (using the same Python we'll run the app with)
+echo "  ▸ Installing Python packages…"
+"$PYTHON" -m pip install rumps watchdog pyobjc-core pyobjc-framework-Cocoa \
+    --quiet --break-system-packages 2>/dev/null \
+  || "$PYTHON" -m pip install rumps watchdog pyobjc-core pyobjc-framework-Cocoa --quiet
+echo "    ✅ Python packages ready"
+echo ""
+
+# ── 4. Stop any running instance before replacing files ───────────────────────
+pkill -f "app.py" 2>/dev/null || true
+sleep 0.5
+
+# ── 5. Build .app bundle ──────────────────────────────────────────────────────
+echo "  ▸ Building $APP_NAME.app…"
+
 mkdir -p "$HOME/Applications"
 rm -rf "$APP_DIR"
 mkdir -p "$APP_DIR/Contents/MacOS"
@@ -108,13 +114,11 @@ INFOPLIST
 # ── App icon (.icns from icon.png) ────────────────────────────────────────────
 ICON_SRC="$SRC_DIR/icon.png"
 if [ -f "$ICON_SRC" ] && command -v sips &>/dev/null && command -v iconutil &>/dev/null; then
-  # Use mktemp so the temp dir is always clean and $TMPDIR trailing-slash issues
-  # (common on macOS) can't corrupt the iconset path.
   ICONSET_PARENT="$(mktemp -d)"
   ICONSET="$ICONSET_PARENT/AppIcon.iconset"
   mkdir -p "$ICONSET"
 
-  # Standard Apple iconset sizes — 64 is NOT a valid size; iconutil ignores it.
+  # Standard Apple iconset sizes (64 is not a valid size — iconutil rejects it)
   for sz in 16 32 128 256 512; do
     sips -z $sz $sz "$ICON_SRC" --out "$ICONSET/icon_${sz}x${sz}.png"      &>/dev/null
     sz2=$((sz * 2))
@@ -123,9 +127,8 @@ if [ -f "$ICON_SRC" ] && command -v sips &>/dev/null && command -v iconutil &>/d
 
   if iconutil -c icns "$ICONSET" -o "$APP_DIR/Contents/Resources/AppIcon.icns" 2>/dev/null; then
     echo "    ✅ Icon applied"
-    # Tell Finder and Dock to pick up the new icon immediately
+    # Touch the bundle so Finder re-reads it — no Dock restart needed
     touch "$APP_DIR"
-    killall Dock 2>/dev/null || true
   else
     echo "    ⚠️  Icon conversion failed (app will use default icon)"
   fi
@@ -135,16 +138,18 @@ fi
 echo "    ✅ $APP_NAME.app built → $APP_DIR"
 echo ""
 
-# ── 4. Clear Gatekeeper quarantine ───────────────────────────────────────────
+# ── 6. Clear Gatekeeper quarantine ───────────────────────────────────────────
 xattr -cr "$APP_DIR" 2>/dev/null || true
 
-# ── 5. Done ───────────────────────────────────────────────────────────────────
+# ── 7. Done ───────────────────────────────────────────────────────────────────
 echo ""
-echo "  ✅  Done!  Open Finder → go to your Home folder → Applications → double-click ScreenshotToAI"
+echo "  ✅  Done!"
+echo ""
+echo "  Open Finder → your Home folder → Applications → double-click ScreenshotToAI"
 echo ""
 echo "  First launch: macOS will ask for Accessibility permission — allow it."
-echo "  Then click the 📸 icon and enable 'Start at Login' to make it permanent."
+echo "  Then click the 📸 icon and enable 'Start at Login' to keep it in your menu bar."
 echo ""
-echo "  Tip: to view logs any time:"
+echo "  Tip: to view logs:"
 echo "    tail -f ~/Library/Logs/screenshot-to-ai.log"
 echo ""

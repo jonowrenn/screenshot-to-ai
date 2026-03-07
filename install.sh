@@ -40,7 +40,24 @@ echo ""
 # ── 3. Build .app bundle ──────────────────────────────────────────────────────
 echo "  ▸ Building $APP_NAME.app…"
 
-PYTHON="$(which python3)"
+# Prefer system / Homebrew Python over any IDE-bundled python3 (PyCharm, etc.)
+# which PyCharm registers on PATH and whose invocation causes PyCharm to open.
+PYTHON=""
+for candidate in \
+    /usr/bin/python3 \
+    /opt/homebrew/bin/python3 \
+    /usr/local/bin/python3 \
+    "$(command -v python3 2>/dev/null)" \
+    "$(command -v python 2>/dev/null)"; do
+  if [ -x "$candidate" ]; then
+    PYTHON="$candidate"
+    break
+  fi
+done
+if [ -z "$PYTHON" ]; then
+  echo "  ❌ Python 3 not found. Install it from https://www.python.org and re-run."
+  exit 1
+fi
 mkdir -p "$HOME/Applications"
 rm -rf "$APP_DIR"
 mkdir -p "$APP_DIR/Contents/MacOS"
@@ -121,27 +138,9 @@ echo ""
 # ── 4. Clear Gatekeeper quarantine ───────────────────────────────────────────
 xattr -cr "$APP_DIR" 2>/dev/null || true
 
-# ── 5. Optional: copy to /Applications ───────────────────────────────────────
-echo "  The app is in ~/Applications."
+# ── 5. Done ───────────────────────────────────────────────────────────────────
 echo ""
-# Print prompt explicitly first — read -p doesn't show the prompt when </dev/tty
-# is redirected on macOS bash (curl | bash scenario).
-printf "  Also copy to /Applications (system-wide)? [y/N] "
-if read -r _choice </dev/tty 2>/dev/null; then
-  case "$_choice" in
-    [Yy]*)
-      sudo cp -R "$APP_DIR" /Applications/
-      sudo xattr -cr "/Applications/$APP_NAME.app" 2>/dev/null || true
-      sudo touch "/Applications/$APP_NAME.app" 2>/dev/null || true
-      echo "    ✅ Copied to /Applications/$APP_NAME.app"
-      killall Dock 2>/dev/null || true
-      ;;
-  esac
-fi
-
-# ── 6. Done ───────────────────────────────────────────────────────────────────
-echo ""
-echo "  ✅  Done!  Open Finder → Applications → double-click ScreenshotToAI"
+echo "  ✅  Done!  Open Finder → go to your Home folder → Applications → double-click ScreenshotToAI"
 echo ""
 echo "  First launch: macOS will ask for Accessibility permission — allow it."
 echo "  Then click the 📸 icon and enable 'Start at Login' to make it permanent."

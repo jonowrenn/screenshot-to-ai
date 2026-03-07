@@ -1,10 +1,10 @@
 #!/bin/bash
 # ── Screenshot to AI — one-command installer ──────────────────────────────────
 #
-# Installs a real macOS .app into ~/Applications and optionally /Applications.
-# Run this once, then double-click the app or enable "Start at Login" in menu.
+# curl -fsSL https://raw.githubusercontent.com/jonowrenn/screenshot-to-ai/main/install.sh | bash
 #
-#   curl -fsSL https://raw.githubusercontent.com/jonowrenn/screenshot-to-ai/main/install.sh | bash
+# Builds a real .app bundle in ~/Applications.
+# Run once, then double-click or enable "Start at Login" from the menu bar icon.
 
 set -e
 
@@ -26,7 +26,7 @@ rm -rf "$SRC_DIR"
 mkdir -p "$SRC_DIR"
 curl -fsSL "https://github.com/$REPO/archive/$BRANCH.tar.gz" \
   | tar -xz -C "$SRC_DIR" --strip-components=1
-echo "    ✅ Source downloaded → $SRC_DIR"
+echo "    ✅ Source downloaded"
 echo ""
 
 # ── 2. Install Python dependencies ───────────────────────────────────────────
@@ -37,7 +37,7 @@ pip3 install rumps watchdog pyobjc-core pyobjc-framework-Cocoa \
 echo "    ✅ Python packages ready"
 echo ""
 
-# ── 3. Build the .app bundle ──────────────────────────────────────────────────
+# ── 3. Build .app bundle ──────────────────────────────────────────────────────
 echo "  ▸ Building $APP_NAME.app…"
 
 PYTHON="$(which python3)"
@@ -46,70 +46,92 @@ rm -rf "$APP_DIR"
 mkdir -p "$APP_DIR/Contents/MacOS"
 mkdir -p "$APP_DIR/Contents/Resources"
 
-# Bundle the source inside the .app so it's fully self-contained
+# Bundle app source
 cp "$SRC_DIR/app.py" "$APP_DIR/Contents/Resources/app.py"
 
-# Launcher script — runs python3 with the bundled source
-cat > "$APP_DIR/Contents/MacOS/$APP_NAME" << LAUNCHER
-#!/bin/bash
-RESOURCES="\$(cd "\$(dirname "\$0")/../Resources" && pwd)"
-exec "$PYTHON" "\$RESOURCES/app.py"
-LAUNCHER
-chmod +x "$APP_DIR/Contents/MacOS/$APP_NAME"
+# ── Launcher script (printf avoids heredoc quote-escaping issues) ─────────────
+LAUNCHER_PATH="$APP_DIR/Contents/MacOS/$APP_NAME"
+printf '#!/bin/bash\n' > "$LAUNCHER_PATH"
+printf 'RESOURCES="$(cd "$(dirname "$0")/../Resources" && pwd)"\n' >> "$LAUNCHER_PATH"
+printf 'exec %s "$RESOURCES/app.py"\n' "$PYTHON" >> "$LAUNCHER_PATH"
+chmod +x "$LAUNCHER_PATH"
 
-# Info.plist — LSUIElement=true keeps it out of the Dock (menu-bar-only app)
-cat > "$APP_DIR/Contents/Info.plist" << PLIST
+# ── Info.plist ────────────────────────────────────────────────────────────────
+PLIST_PATH="$APP_DIR/Contents/Info.plist"
+cat > "$PLIST_PATH" << INFOPLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>CFBundleExecutable</key>   <string>$APP_NAME</string>
-  <key>CFBundleIdentifier</key>   <string>$BUNDLE_ID</string>
-  <key>CFBundleName</key>         <string>Screenshot to AI</string>
-  <key>CFBundleDisplayName</key>  <string>Screenshot to AI</string>
-  <key>CFBundleVersion</key>      <string>1.0.0</string>
-  <key>CFBundleShortVersionString</key> <string>1.0</string>
-  <key>LSMinimumSystemVersion</key>    <string>10.15</string>
-  <key>LSUIElement</key>          <true/>
-  <key>NSHighResolutionCapable</key>   <true/>
-  <key>NSHumanReadableDescription</key>
-  <string>Automatically pastes screenshots into Claude.ai or ChatGPT.</string>
+  <key>CFBundleExecutable</key>
+  <string>${APP_NAME}</string>
+  <key>CFBundleIdentifier</key>
+  <string>${BUNDLE_ID}</string>
+  <key>CFBundleName</key>
+  <string>Screenshot to AI</string>
+  <key>CFBundleDisplayName</key>
+  <string>Screenshot to AI</string>
+  <key>CFBundleIconFile</key>
+  <string>AppIcon</string>
+  <key>CFBundleVersion</key>
+  <string>1.0.0</string>
+  <key>CFBundleShortVersionString</key>
+  <string>1.0</string>
+  <key>LSMinimumSystemVersion</key>
+  <string>10.15</string>
+  <key>LSUIElement</key>
+  <true/>
+  <key>NSHighResolutionCapable</key>
+  <true/>
 </dict>
 </plist>
-PLIST
+INFOPLIST
 
-echo "    ✅ $APP_NAME.app built"
-echo ""
+# ── App icon (.icns from icon.png) ────────────────────────────────────────────
+ICON_SRC="$SRC_DIR/icon.png"
+if [ -f "$ICON_SRC" ] && command -v sips &>/dev/null && command -v iconutil &>/dev/null; then
+  ICONSET="$TMPDIR/AppIcon.iconset"
+  rm -rf "$ICONSET" && mkdir -p "$ICONSET"
 
-# ── 4. Ask about /Applications ───────────────────────────────────────────────
-echo "  The app is ready at:"
-echo "    $APP_DIR"
-echo ""
-read -r -p "  Also copy to /Applications (system-wide, requires password)? [y/N] " choice
-if [[ "$choice" =~ ^[Yy]$ ]]; then
-    sudo cp -R "$APP_DIR" /Applications/
-    echo "    ✅ Copied to /Applications/$APP_NAME.app"
+  for sz in 16 32 64 128 256 512; do
+    sips -z $sz $sz "$ICON_SRC" --out "$ICONSET/icon_${sz}x${sz}.png"      &>/dev/null
+    sz2=$((sz * 2))
+    sips -z $sz2 $sz2 "$ICON_SRC" --out "$ICONSET/icon_${sz}x${sz}@2x.png" &>/dev/null
+  done
+
+  iconutil -c icns "$ICONSET" -o "$APP_DIR/Contents/Resources/AppIcon.icns" 2>/dev/null \
+    && echo "    ✅ Icon applied" || echo "    ⚠️  Icon conversion failed (app will use default icon)"
+  rm -rf "$ICONSET"
 fi
 
-# ── 5. Grant Gatekeeper trust so macOS doesn't block on first launch ──────────
+echo "    ✅ $APP_NAME.app built → $APP_DIR"
+echo ""
+
+# ── 4. Clear Gatekeeper quarantine ───────────────────────────────────────────
 xattr -cr "$APP_DIR" 2>/dev/null || true
-if [ -d "/Applications/$APP_NAME.app" ]; then
-    sudo xattr -cr "/Applications/$APP_NAME.app" 2>/dev/null || true
+
+# ── 5. Optional: copy to /Applications ───────────────────────────────────────
+echo "  The app is in ~/Applications."
+echo ""
+# Read from /dev/tty so this works even when script is piped via curl | bash
+if read -r -p "  Also copy to /Applications (system-wide)? [y/N] " _choice </dev/tty 2>/dev/null; then
+  case "$_choice" in
+    [Yy]*)
+      sudo cp -R "$APP_DIR" /Applications/
+      sudo xattr -cr "/Applications/$APP_NAME.app" 2>/dev/null || true
+      echo "    ✅ Copied to /Applications/$APP_NAME.app"
+      ;;
+  esac
 fi
 
 # ── 6. Done ───────────────────────────────────────────────────────────────────
 echo ""
-echo "  ✅  All done!"
+echo "  ✅  Done!  Open Finder → Applications → double-click ScreenshotToAI"
 echo ""
-echo "  How to use:"
-echo "    1. Open Finder → Applications (or use Spotlight: ScreenshotToAI)"
-echo "    2. Double-click ScreenshotToAI to launch"
-echo "    3. The 📸 icon appears in your menu bar"
-echo "    4. Click it and enable 'Start at Login' so it's always there"
+echo "  First launch: macOS will ask for Accessibility permission — allow it."
+echo "  Then click the 📸 icon and enable 'Start at Login' to make it permanent."
 echo ""
-echo "  Required permissions (macOS will prompt on first use):"
-echo "    • Accessibility  — for pasting into Chrome"
-echo "    • Screen Recording — macOS may request this on Ventura+"
-echo "    • Notifications  — for paste confirmations"
+echo "  Tip: to view logs any time:"
+echo "    tail -f ~/Library/Logs/screenshot-to-ai.log"
 echo ""

@@ -381,30 +381,64 @@ class ScreenshotToAIApp(rumps.App):
             self.status_item,
         ]
 
-        # ── Attach iOS-style NSSwitch to the Auto-paste toggle ────────────────
-        # Must happen AFTER self.menu is assigned (so the NSMenuItem exists).
-        self._switch_refs = None   # keep ObjC objects alive
+        # NSSwitch is attached via a short timer AFTER the app finishes launching.
+        # Setting the view during __init__ is too early — the NSMenu isn't
+        # fully wired up yet and the view gets dropped silently.
+        self._switch_refs = None
         self._nsswitch    = None
+        self.toggle_item.state = 1   # checkmark fallback until switch attaches
+
         if _NSSWITCH_AVAILABLE:
-            try:
-                target_ref, sw = _attach_switch(
-                    self.toggle_item, "Auto-paste",
-                    initial_on=True,
-                    callback=self._on_switch_toggled,
-                )
-                self._switch_refs = target_ref
-                self._nsswitch    = sw
-                log("NSSwitch toggle attached ✅")
-            except Exception as e:
-                log(f"NSSwitch unavailable ({e}), using checkmark fallback")
-                self.toggle_item.state = 1
-        else:
-            self.toggle_item.state = 1   # fallback: plain checkmark
+            rumps.Timer(self._deferred_attach_switch, 0.4).start()
 
         self._start_watcher()
 
         # Auto-discover an AI tab on startup so first screenshot works immediately
         threading.Thread(target=self._auto_discover, daemon=True).start()
+
+    # ── Deferred NSSwitch setup ───────────────────────────────────────────────
+
+    def _deferred_attach_switch(self, timer):
+        """
+        Called ~0.4 s after launch so the NSMenu is fully built.
+        Finds the 'Auto-paste' menu item by title inside the real NSMenu
+        and replaces it with a label + NSSwitch custom view.
+        """
+        import traceback
+        timer.stop()
+        try:
+            # self._menu is the rumps NSMenu subclass — find our item by title
+            item = self._menu.itemWithTitle_("Auto-paste")
+            if item is None:
+                log("NSSwitch setup: item 'Auto-paste' not found in NSMenu")
+                return
+
+            W, H = 240, 30
+            view = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, W, H))
+
+            lbl = NSTextField.labelWithString_("Auto-paste")
+            lbl.setFrame_(NSMakeRect(14, 6, 150, 18))
+            lbl.setFont_(NSFont.menuFontOfSize_(13.0))
+            view.addSubview_(lbl)
+
+            sw = NSSwitch.alloc().initWithFrame_(NSMakeRect(168, 4, 51, 22))
+            sw.setState_(1 if self.enabled else 0)
+
+            tgt = _SwitchTarget.alloc().init_with_callback(self._on_switch_toggled)
+            sw.setTarget_(tgt)
+            sw.setAction_(objc.selector(tgt.toggled_, signature=b'v@:@'))
+            view.addSubview_(sw)
+
+            item.setView_(view)
+
+            # Keep ObjC objects alive (Python GC would free them otherwise)
+            self._switch_refs = tgt
+            self._nsswitch    = sw
+            log("NSSwitch toggle attached ✅")
+
+        except Exception:
+            log(f"NSSwitch setup failed (checkmark fallback):\n{traceback.format_exc()}")
+            self.toggle_item.state = 1 if self.enabled else 0
 
     # ── Auto-discover on startup ───────────────────────────────────────────────
 

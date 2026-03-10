@@ -349,16 +349,20 @@ def activate_tab_and_paste(window_idx: int, tab_idx: int, filepath: str) -> bool
         "(function(){"
         "var el=document.getElementById('prompt-textarea');"
         "if(!el)el=document.querySelector('.ProseMirror');"
-        "if(!el)el=document.querySelector('[contenteditable=\"true\"]');"
+        "if(!el)el=document.querySelector('[contenteditable=\\'true\\']');"
         "if(!el)el=document.querySelector('textarea');"
         "if(el){el.click();el.focus();"
         "return 'focused:'+el.tagName+(el.id?'#'+el.id:'');}"
         "return 'INPUT NOT FOUND';})()"
     )
+    # Escape any remaining double-quotes so the JS string doesn't break the
+    # surrounding AppleScript double-quoted string (the root cause of the
+    # "syntax error: Expected end of line but found 'true'" error).
+    js_esc = js.replace('"', '\\"')
     js_result, js_err = run_applescript(f"""
     tell application "Google Chrome"
         tell tab {tab_idx} of window {window_idx}
-            execute javascript "{js}"
+            execute javascript "{js_esc}"
         end tell
     end tell
     """)

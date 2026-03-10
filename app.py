@@ -11,6 +11,7 @@ import time
 import threading
 import subprocess
 import glob
+import json
 from typing import Optional, Tuple, List, Dict
 import rumps
 
@@ -168,6 +169,15 @@ def log(msg: str):
 def run_applescript(script: str) -> Tuple[str, str]:
     result = subprocess.run(
         ["osascript", "-e", script],
+        capture_output=True, text=True
+    )
+    return result.stdout.strip(), result.stderr.strip()
+
+
+def run_jxa(script: str) -> Tuple[str, str]:
+    """Run a JXA (JavaScript for Automation) script via osascript -l JavaScript."""
+    result = subprocess.run(
+        ["osascript", "-l", "JavaScript", "-e", script],
         capture_output=True, text=True
     )
     return result.stdout.strip(), result.stderr.strip()
@@ -345,27 +355,26 @@ def activate_tab_and_paste(window_idx: int, tab_idx: int, filepath: str) -> bool
     log("  Step 2: ✅ Chrome activated")
 
     log("  Step 3: Focusing input via JavaScript...")
+    # Use JXA (JavaScript for Automation) + json.dumps so ALL special chars
+    # are escaped correctly — no AppleScript string-quoting issues possible.
     js = (
         "(function(){"
         "var el=document.getElementById('prompt-textarea');"
         "if(!el)el=document.querySelector('.ProseMirror');"
-        "if(!el)el=document.querySelector('[contenteditable=\\'true\\']');"
+        "if(!el)el=document.querySelector('[contenteditable=\"true\"]');"
         "if(!el)el=document.querySelector('textarea');"
         "if(el){el.click();el.focus();"
         "return 'focused:'+el.tagName+(el.id?'#'+el.id:'');}"
         "return 'INPUT NOT FOUND';})()"
     )
-    # Escape any remaining double-quotes so the JS string doesn't break the
-    # surrounding AppleScript double-quoted string (the root cause of the
-    # "syntax error: Expected end of line but found 'true'" error).
-    js_esc = js.replace('"', '\\"')
-    js_result, js_err = run_applescript(f"""
-    tell application "Google Chrome"
-        tell tab {tab_idx} of window {window_idx}
-            execute javascript "{js_esc}"
-        end tell
-    end tell
-    """)
+    js_literal = json.dumps(js)  # produces a properly-escaped JS/JSON string literal
+    # JXA: windows[] and tabs[] are 0-based, AppleScript indices are 1-based
+    jxa = (
+        f"var chrome=Application('Google Chrome');"
+        f"var tab=chrome.windows[{window_idx-1}].tabs[{tab_idx-1}];"
+        f"tab.execute({{javascript:{js_literal}}});"
+    )
+    js_result, js_err = run_jxa(jxa)
     log(f"  Step 3 JS: {js_result or js_err or 'no output'}")
 
     if "INPUT NOT FOUND" in (js_result or "") or not js_result:

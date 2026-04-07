@@ -51,19 +51,19 @@ echo ""
 
 # ── 3. Install Python dependencies (using the same Python we'll run the app with)
 echo "  ▸ Installing Python packages…"
-"$PYTHON" -m pip install rumps watchdog pyobjc-core pyobjc-framework-Cocoa \
+"$PYTHON" -m pip install rumps watchdog "pyobjc-core==9.2" "pyobjc-framework-Cocoa==9.2" \
     --quiet --break-system-packages 2>/dev/null \
-  || "$PYTHON" -m pip install rumps watchdog pyobjc-core pyobjc-framework-Cocoa \
+  || "$PYTHON" -m pip install rumps watchdog "pyobjc-core==9.2" "pyobjc-framework-Cocoa==9.2" \
     --user --quiet 2>/dev/null \
-  || "$PYTHON" -m pip install rumps watchdog pyobjc-core pyobjc-framework-Cocoa --quiet
+  || "$PYTHON" -m pip install rumps watchdog "pyobjc-core==9.2" "pyobjc-framework-Cocoa==9.2" --quiet
 
 # Verify the packages are actually importable with this Python
 if ! "$PYTHON" -c "import rumps, watchdog" 2>/dev/null; then
   echo "    ❌ Package import failed. Trying --user install…"
-  "$PYTHON" -m pip install rumps watchdog pyobjc-core pyobjc-framework-Cocoa --user 2>/dev/null
+  "$PYTHON" -m pip install rumps watchdog "pyobjc-core==9.2" "pyobjc-framework-Cocoa==9.2" --user 2>/dev/null
   if ! "$PYTHON" -c "import rumps, watchdog" 2>/dev/null; then
     echo "    ❌ Could not install packages for $PYTHON"
-    echo "       Try: $PYTHON -m pip install rumps watchdog pyobjc-core pyobjc-framework-Cocoa"
+    echo "       Try: $PYTHON -m pip install rumps watchdog pyobjc-core==9.2 pyobjc-framework-Cocoa==9.2"
     exit 1
   fi
 fi

@@ -12,7 +12,28 @@ import threading
 import subprocess
 import glob
 import json
+import ctypes
 from typing import Optional, Tuple, List, Dict
+
+LOG_PATH = os.path.expanduser("~/Library/Logs/screenshot-to-ai.log")
+APP_SUPPORT_DIR = os.path.expanduser("~/Library/Application Support/screenshot-to-ai")
+SETUP_STATE_PATH = os.path.join(APP_SUPPORT_DIR, "setup.json")
+
+
+def _prelaunch_hide_dock_icon():
+    try:
+        from AppKit import NSApplication, NSApplicationActivationPolicyProhibited
+        NSApplication.sharedApplication().setActivationPolicy_(
+            NSApplicationActivationPolicyProhibited
+        )
+        return True
+    except Exception:
+        return False
+
+
+if __name__ == "__main__":
+    _prelaunch_hide_dock_icon()
+
 import rumps
 
 # watchdog is only used as a fallback if Spotlight is unavailable
@@ -33,10 +54,35 @@ try:
     from AppKit import (
         NSMenuItem, NSView, NSSwitch, NSTextField,
         NSFont, NSColor, NSMakeRect, NSAppearance,
+        NSApplication, NSApplicationActivationPolicyAccessory,
+        NSApplicationActivationPolicyProhibited,
+        NSRunningApplication,
+        NSAlert, NSWindow, NSButton, NSBox,
+        NSWindowStyleMaskTitled, NSWindowStyleMaskClosable,
+        NSBackingStoreBuffered, NSLineBreakByWordWrapping,
     )
     _NSSWITCH_AVAILABLE = True
 except Exception:
     _NSSWITCH_AVAILABLE = False
+
+try:
+    from Quartz import (
+        CGEventCreateKeyboardEvent,
+        CGEventPost,
+        CGEventPostToPid,
+        CGEventSetFlags,
+        kCGAnnotatedSessionEventTap,
+        kCGEventFlagMaskCommand,
+    )
+    _QUARTZ_EVENTS_AVAILABLE = True
+except Exception:
+    _QUARTZ_EVENTS_AVAILABLE = False
+
+try:
+    from PyObjCTools import AppHelper
+    _APPHELPER_AVAILABLE = True
+except Exception:
+    _APPHELPER_AVAILABLE = False
 
 
 if _NSSWITCH_AVAILABLE:
@@ -52,6 +98,17 @@ if _NSSWITCH_AVAILABLE:
 
         def toggled_(self, sender):
             self._cb(bool(sender.state()))
+
+
+    class _CallbackTarget(NSObject):
+        @objc.python_method
+        def init_with_callback(self, callback):
+            self = self.init()
+            self._cb = callback
+            return self
+
+        def triggered_(self, sender):
+            self._cb(sender)
 
 
     def _attach_switch(rumps_item, label: str, initial_on: bool, callback):
@@ -85,7 +142,7 @@ if _NSSWITCH_AVAILABLE:
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 
-SCREENSHOT_EXTS  = {".png", ".jpg", ".jpeg"}
+SCREENSHOT_EXTS  = {".png", ".jpg", ".jpeg", ".tiff", ".tif"}
 DEBOUNCE_SECONDS = 2.0
 
 # ── Spotlight-based screenshot watcher ─────────────────────────────────────────
@@ -131,10 +188,10 @@ class SpotlightScreenshotWatcher:
 
     def _mdfind(self) -> set:
         try:
-            r = subprocess.run(
+            r = run_command(
                 ["mdfind", "-onlyin", os.path.expanduser("~"),
                  "kMDItemIsScreenCapture == 1"],
-                capture_output=True, text=True, timeout=3
+                timeout=3
             )
             return {p.strip() for p in r.stdout.strip().split("\n") if p.strip()}
         except Exception:
@@ -163,32 +220,41 @@ class SpotlightScreenshotWatcher:
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def log(msg: str):
-    print(f"[screenshot-to-ai] {msg}", flush=True)
+    line = f"[screenshot-to-ai] {msg}"
+    print(line, flush=True)
+    try:
+        os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+
+def run_command(args: List[str], timeout: Optional[float] = None) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        args,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout,
+    )
 
 
 def run_applescript(script: str) -> Tuple[str, str]:
-    result = subprocess.run(
-        ["osascript", "-e", script],
-        capture_output=True, text=True
-    )
+    result = run_command(["osascript", "-e", script])
     return result.stdout.strip(), result.stderr.strip()
 
 
 def run_jxa(script: str) -> Tuple[str, str]:
     """Run a JXA (JavaScript for Automation) script via osascript -l JavaScript."""
-    result = subprocess.run(
-        ["osascript", "-l", "JavaScript", "-e", script],
-        capture_output=True, text=True
-    )
+    result = run_command(["osascript", "-l", "JavaScript", "-e", script])
     return result.stdout.strip(), result.stderr.strip()
 
 
 def get_screenshot_dirs() -> List[str]:
     dirs = []
-    r = subprocess.run(
-        ["defaults", "read", "com.apple.screencapture", "location"],
-        capture_output=True, text=True
-    )
+    r = run_command(["defaults", "read", "com.apple.screencapture", "location"])
     if r.returncode == 0 and r.stdout.strip():
         custom = os.path.expanduser(r.stdout.strip())
         if os.path.isdir(custom):
@@ -200,6 +266,19 @@ def get_screenshot_dirs() -> List[str]:
     return dirs
 
 
+def can_access_directory(path: str) -> bool:
+    try:
+        with os.scandir(path) as it:
+            next(it, None)
+        return True
+    except PermissionError:
+        return False
+    except FileNotFoundError:
+        return False
+    except Exception:
+        return True
+
+
 def is_real_screenshot(path: str) -> bool:
     name = os.path.basename(path)
     if name.startswith("."):
@@ -208,38 +287,220 @@ def is_real_screenshot(path: str) -> bool:
     return ext.lower() in SCREENSHOT_EXTS
 
 
-# ── Chrome tab helpers ─────────────────────────────────────────────────────────
+def is_accessibility_trusted(prompt: bool = False) -> bool:
+    try:
+        app_services = ctypes.CDLL(
+            "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices"
+        )
+        if not prompt:
+            app_services.AXIsProcessTrusted.restype = ctypes.c_bool
+            return bool(app_services.AXIsProcessTrusted())
 
-def get_tab_url(window_idx: int, tab_idx: int) -> str:
+        core_foundation = ctypes.CDLL(
+            "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+        )
+
+        app_services.AXIsProcessTrustedWithOptions.argtypes = [ctypes.c_void_p]
+        app_services.AXIsProcessTrustedWithOptions.restype = ctypes.c_bool
+
+        core_foundation.CFDictionaryCreate.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.c_long,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+        ]
+        core_foundation.CFDictionaryCreate.restype = ctypes.c_void_p
+        core_foundation.CFRelease.argtypes = [ctypes.c_void_p]
+
+        key = ctypes.c_void_p.in_dll(app_services, "kAXTrustedCheckOptionPrompt")
+        value = ctypes.c_void_p.in_dll(core_foundation, "kCFBooleanTrue")
+        options = core_foundation.CFDictionaryCreate(
+            None,
+            (ctypes.c_void_p * 1)(key.value),
+            (ctypes.c_void_p * 1)(value.value),
+            1,
+            None,
+            None,
+        )
+        try:
+            return bool(app_services.AXIsProcessTrustedWithOptions(options))
+        finally:
+            if options:
+                core_foundation.CFRelease(options)
+    except Exception as e:
+        log(f"Accessibility trust check failed: {e}")
+        return False
+
+
+def open_accessibility_settings():
+    subprocess.run(
+        [
+            "open",
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
+        ],
+        capture_output=True,
+    )
+
+
+def suppress_dock_icon():
+    try:
+        NSApplication.sharedApplication().setActivationPolicy_(
+            NSApplicationActivationPolicyProhibited
+        )
+    except Exception:
+        try:
+            NSApplication.sharedApplication().setActivationPolicy_(
+                NSApplicationActivationPolicyAccessory
+            )
+        except Exception:
+            pass
+
+
+# ── Multi-browser support ───────────────────────────────────────────────────────
+# All Chromium-based browsers expose the same AppleScript/JXA interface.
+# Each entry: (AppleScript app name, bundle ID, pgrep process name)
+
+BROWSERS = [
+    ("Google Chrome",          "com.google.Chrome",               "Google Chrome"),
+    ("Arc",                    "company.thebrowser.Browser",       "Arc"),
+    ("Brave Browser",          "com.brave.Browser",                "Brave Browser"),
+    ("Microsoft Edge",         "com.microsoft.edgemac",            "Microsoft Edge"),
+]
+
+
+def get_running_browser() -> Optional[str]:
+    """Return the AppleScript app name of the first supported browser that is running."""
+    for app_name, bundle_id, pgrep_name in BROWSERS:
+        if _NSSWITCH_AVAILABLE:
+            try:
+                apps = NSRunningApplication.runningApplicationsWithBundleIdentifier_(bundle_id)
+                if apps:
+                    return app_name
+                continue
+            except Exception:
+                pass
+        result = subprocess.run(["pgrep", "-x", pgrep_name], capture_output=True, text=True)
+        if result.returncode == 0:
+            return app_name
+    return None
+
+
+def is_chrome_running() -> bool:
+    return get_running_browser() is not None
+
+
+def get_browser_pid(app_name: Optional[str] = None) -> Optional[int]:
+    if not _NSSWITCH_AVAILABLE:
+        return None
+    if app_name is None:
+        app_name = get_running_browser()
+    if app_name is None:
+        return None
+    bundle_id = next((b for a, b, _ in BROWSERS if a == app_name), None)
+    if bundle_id is None:
+        return None
+    try:
+        apps = NSRunningApplication.runningApplicationsWithBundleIdentifier_(bundle_id)
+        if not apps:
+            return None
+        frontmost = [app for app in apps if app.isActive()]
+        target = frontmost[0] if frontmost else apps[0]
+        return int(target.processIdentifier())
+    except Exception as e:
+        log(f"  Browser PID lookup failed: {e}")
+        return None
+
+
+def get_chrome_pid() -> Optional[int]:
+    return get_browser_pid()
+
+
+def send_native_cmd_v(target_pid: Optional[int] = None) -> bool:
+    if not _QUARTZ_EVENTS_AVAILABLE:
+        log("  Native Cmd+V unavailable: Quartz events not available")
+        return False
+    try:
+        # Real key chord: Command down -> V down -> V up -> Command up.
+        # Chrome appears to ignore a single flagged V event in this flow.
+        cmd_down = CGEventCreateKeyboardEvent(None, 55, True)
+        key_down = CGEventCreateKeyboardEvent(None, 9, True)
+        key_up = CGEventCreateKeyboardEvent(None, 9, False)
+        cmd_up = CGEventCreateKeyboardEvent(None, 55, False)
+        CGEventSetFlags(key_down, kCGEventFlagMaskCommand)
+        CGEventSetFlags(key_up, kCGEventFlagMaskCommand)
+        if target_pid:
+            CGEventPostToPid(target_pid, cmd_down)
+            time.sleep(0.01)
+            CGEventPostToPid(target_pid, key_down)
+            time.sleep(0.02)
+            CGEventPostToPid(target_pid, key_up)
+            time.sleep(0.01)
+            CGEventPostToPid(target_pid, cmd_up)
+        else:
+            CGEventPost(kCGAnnotatedSessionEventTap, cmd_down)
+            time.sleep(0.01)
+            CGEventPost(kCGAnnotatedSessionEventTap, key_down)
+            time.sleep(0.02)
+            CGEventPost(kCGAnnotatedSessionEventTap, key_up)
+            time.sleep(0.01)
+            CGEventPost(kCGAnnotatedSessionEventTap, cmd_up)
+        log(f"  Step 4: native Cmd+V sent{' to pid ' + str(target_pid) if target_pid else ''}")
+        return True
+    except Exception as e:
+        log(f"  Native Cmd+V failed: {e}")
+        return False
+
+
+# ── Browser tab helpers ────────────────────────────────────────────────────────
+
+def get_tab_url(window_idx: int, tab_idx: int, browser: Optional[str] = None) -> str:
+    browser = browser or get_running_browser() or "Google Chrome"
     out, _ = run_applescript(f"""
-    tell application "Google Chrome"
+    tell application "{browser}"
         return URL of tab {tab_idx} of window {window_idx}
     end tell
     """)
     return out.lower()
 
 
-def get_tab_title(window_idx: int, tab_idx: int) -> str:
+def get_tab_title(window_idx: int, tab_idx: int, browser: Optional[str] = None) -> str:
+    browser = browser or get_running_browser() or "Google Chrome"
     out, _ = run_applescript(f"""
-    tell application "Google Chrome"
+    tell application "{browser}"
         return title of tab {tab_idx} of window {window_idx}
     end tell
     """)
     return out
 
 
+AI_DOMAINS = [
+    "claude.ai",
+    "chat.openai.com",
+    "chatgpt.com",
+    "gemini.google.com",
+    "perplexity.ai",
+    "grok.com",
+    "x.com/i/grok",
+]
+
+
 def is_ai_url(url: str) -> bool:
-    return any(d in url for d in ["claude.ai", "chat.openai.com", "chatgpt.com"])
+    return any(d in url for d in AI_DOMAINS)
 
 
 def scan_all_ai_tabs() -> List[Dict]:
     """
-    Scan every tab in every Chrome window and return a list of AI tabs.
-    Each entry: {"window": int, "tab": int, "url": str, "title": str, "active": bool}
+    Scan every tab in every browser window and return a list of AI tabs.
+    Each entry: {"window": int, "tab": int, "url": str, "title": str, "active": bool, "browser": str}
     Uses 'output' not 'result' — 'result' is a reserved AppleScript keyword.
     """
-    out, err = run_applescript("""
-    tell application "Google Chrome"
+    browser = get_running_browser()
+    if not browser:
+        return []
+    out, err = run_applescript(f"""
+    tell application "{browser}"
         set output to ""
         set winIdx to 0
         repeat with w in windows
@@ -249,7 +510,7 @@ def scan_all_ai_tabs() -> List[Dict]:
             repeat with t in tabs of w
                 set tabIdx to tabIdx + 1
                 set u to URL of t
-                if u contains "claude.ai" or u contains "chat.openai.com" or u contains "chatgpt.com" then
+                if u contains "claude.ai" or u contains "chat.openai.com" or u contains "chatgpt.com" or u contains "gemini.google.com" or u contains "perplexity.ai" or u contains "grok.com" then
                     set isActive to (tabIdx is equal to activeIdx)
                     set ttl to title of t
                     set output to output & (winIdx as string) & "|" & (tabIdx as string) & "|" & u & "|" & ttl & "|" & (isActive as string) & "~ENTRY~"
@@ -272,29 +533,33 @@ def scan_all_ai_tabs() -> List[Dict]:
         if len(parts) == 5:
             try:
                 tabs.append({
-                    "window": int(parts[0]),
-                    "tab":    int(parts[1]),
-                    "url":    parts[2].lower(),
-                    "title":  parts[3],
-                    "active": parts[4].strip().lower() == "true",
+                    "window":  int(parts[0]),
+                    "tab":     int(parts[1]),
+                    "url":     parts[2].lower(),
+                    "title":   parts[3],
+                    "active":  parts[4].strip().lower() == "true",
+                    "browser": browser,
                 })
             except ValueError:
                 continue
-    log(f"  scan found {len(tabs)} AI tab(s)")
+    log(f"  scan found {len(tabs)} AI tab(s) in {browser}")
     return tabs
 
 
 def find_active_ai_tab() -> Optional[Tuple[int, int]]:
     """Only checks the currently visible tab of each window (front-to-back)."""
-    out, err = run_applescript("""
-    tell application "Google Chrome"
+    browser = get_running_browser()
+    if not browser:
+        return None
+    out, err = run_applescript(f"""
+    tell application "{browser}"
         set winIdx to 0
         repeat with w in windows
             set winIdx to winIdx + 1
             set activeIdx to active tab index of w
             set t to active tab of w
             set u to URL of t
-            if u contains "claude.ai" or u contains "chat.openai.com" or u contains "chatgpt.com" then
+            if u contains "claude.ai" or u contains "chat.openai.com" or u contains "chatgpt.com" or u contains "gemini.google.com" or u contains "perplexity.ai" or u contains "grok.com" then
                 return (winIdx as string) & "," & (activeIdx as string)
             end if
         end repeat
@@ -318,16 +583,31 @@ def verify_tab(window_idx: int, tab_idx: int) -> bool:
 
 
 def service_name(url: str) -> str:
-    return "Claude" if "claude.ai" in url else "ChatGPT"
+    if "claude.ai" in url:
+        return "Claude"
+    if "gemini.google.com" in url:
+        return "Gemini"
+    if "perplexity.ai" in url:
+        return "Perplexity"
+    if "grok.com" in url or "x.com/i/grok" in url:
+        return "Grok"
+    return "ChatGPT"
 
 
 # ── Clipboard & paste ──────────────────────────────────────────────────────────
 
 def copy_image_to_clipboard(filepath: str) -> bool:
     ext = os.path.splitext(filepath)[1].lower()
-    filetype = "«class PNGf»" if ext == ".png" else "JPEG picture"
+    if ext == ".png":
+        filetype = "«class PNGf»"
+    elif ext in (".tiff", ".tif"):
+        filetype = "TIFF picture"
+    else:
+        filetype = "JPEG picture"
+    # Escape any quotes in the path so AppleScript doesn't break
+    safe_path = filepath.replace("\\", "\\\\").replace('"', '\\"')
     _, err = run_applescript(
-        f'set the clipboard to (read (POSIX file "{filepath}") as {filetype})'
+        f'set the clipboard to (read (POSIX file "{safe_path}") as {filetype})'
     )
     if err:
         log(f"  Clipboard error: {err}")
@@ -335,15 +615,72 @@ def copy_image_to_clipboard(filepath: str) -> bool:
     return True
 
 
+def try_dom_clipboard_upload(window_idx: int, tab_idx: int, browser: Optional[str] = None) -> Tuple[bool, str]:
+    js = (
+        "(async function(){"
+        "function targetEl(){"
+        "return document.getElementById('prompt-textarea')"
+        "|| document.querySelector('.ProseMirror')"
+        "|| document.querySelector('[contenteditable=\"true\"]')"
+        "|| document.querySelector('textarea');"
+        "}"
+        "function fileInput(){"
+        "return document.querySelector('input[type=\"file\"]');"
+        "}"
+        "try{"
+        "if(!navigator.clipboard||!navigator.clipboard.read){return 'clipboard-api-unavailable';}"
+        "const items=await navigator.clipboard.read();"
+        "let blob=null;"
+        "for(const item of items){"
+        "const imgType=item.types.find(t=>t.startsWith('image/'));"
+        "if(imgType){blob=await item.getType(imgType);break;}"
+        "}"
+        "if(!blob){return 'no-image-in-clipboard';}"
+        "const name=(blob.type==='image/jpeg')?'screenshot.jpg':'screenshot.png';"
+        "const file=new File([blob], name, {type: blob.type || 'image/png'});"
+        "const input=fileInput();"
+        "if(input){"
+        "const dt=new DataTransfer();"
+        "dt.items.add(file);"
+        "input.files=dt.files;"
+        "input.dispatchEvent(new Event('input',{bubbles:true}));"
+        "input.dispatchEvent(new Event('change',{bubbles:true}));"
+        "return 'uploaded:file-input';"
+        "}"
+        "const el=targetEl();"
+        "if(!el){return 'no-target-element';}"
+        "const dt=new DataTransfer();"
+        "dt.items.add(file);"
+        "const evt=new ClipboardEvent('paste',{clipboardData: dt, bubbles:true, cancelable:true});"
+        "el.dispatchEvent(evt);"
+        "return 'uploaded:paste-event';"
+        "}catch(e){return 'error:'+String(e&&e.message||e);}"
+        "})()"
+    )
+    js_literal = json.dumps(js)
+    browser = browser or get_running_browser() or "Google Chrome"
+    jxa = (
+        f"var chrome=Application('{browser}');"
+        f"var tab=chrome.windows[{window_idx-1}].tabs[{tab_idx-1}];"
+        f"tab.execute({{javascript:{js_literal}}});"
+    )
+    out, err = run_jxa(jxa)
+    result = out or err or "no output"
+    ok = result.startswith("uploaded:")
+    return ok, result
+
+
 def activate_tab_and_paste(window_idx: int, tab_idx: int, filepath: str) -> bool:
+    browser = get_running_browser() or "Google Chrome"
+
     log("  Step 1: Copying image to clipboard...")
     if not copy_image_to_clipboard(filepath):
         return False
     log("  Step 1: ✅ clipboard set")
 
-    log("  Step 2: Activating Chrome tab...")
+    log(f"  Step 2: Activating {browser} tab...")
     _, err = run_applescript(f"""
-    tell application "Google Chrome"
+    tell application "{browser}"
         set index of window {window_idx} to 1
         set active tab index of window {window_idx} to {tab_idx}
         activate
@@ -351,8 +688,14 @@ def activate_tab_and_paste(window_idx: int, tab_idx: int, filepath: str) -> bool
     """)
     if err:
         log(f"  Step 2 warning: {err}")
-    time.sleep(1.0)
-    log("  Step 2: ✅ Chrome activated")
+    # Poll until the browser is frontmost (max 2 s) rather than sleeping blindly
+    deadline = time.time() + 2.0
+    while time.time() < deadline:
+        check, _ = run_applescript(f'tell application "{browser}" to return (active of front window) as string')
+        if check.strip() == "true":
+            break
+        time.sleep(0.1)
+    log(f"  Step 2: ✅ {browser} activated")
 
     log("  Step 3: Focusing input via JavaScript...")
     # Use JXA (JavaScript for Automation) + json.dumps so ALL special chars
@@ -370,7 +713,7 @@ def activate_tab_and_paste(window_idx: int, tab_idx: int, filepath: str) -> bool
     js_literal = json.dumps(js)  # produces a properly-escaped JS/JSON string literal
     # JXA: windows[] and tabs[] are 0-based, AppleScript indices are 1-based
     jxa = (
-        f"var chrome=Application('Google Chrome');"
+        f"var chrome=Application('{browser}');"
         f"var tab=chrome.windows[{window_idx-1}].tabs[{tab_idx-1}];"
         f"tab.execute({{javascript:{js_literal}}});"
     )
@@ -378,34 +721,21 @@ def activate_tab_and_paste(window_idx: int, tab_idx: int, filepath: str) -> bool
     log(f"  Step 3 JS: {js_result or js_err or 'no output'}")
 
     if "INPUT NOT FOUND" in (js_result or "") or not js_result:
-        log("  Step 3b: JS focus failed — trying coordinate fallback...")
-        bounds_out, _ = run_applescript(f"""
-        tell application "Google Chrome"
-            return bounds of window {window_idx}
-        end tell
-        """)
-        if bounds_out:
-            coords = [int(x.strip()) for x in bounds_out.split(",")]
-            left, top, right, bottom = coords
-            cx = (left + right) // 2
-            for offset in [75, 55, 95]:
-                run_applescript(f"""
-                tell application "System Events"
-                    tell process "Google Chrome"
-                        click at {{{cx}, {bottom - offset}}}
-                    end tell
-                end tell
-                """)
-                time.sleep(0.15)
+        log("  Step 3b: JS focus failed — no coordinate fallback")
 
-    time.sleep(0.5)
+    time.sleep(0.3)
+
+    log("  Step 3c: Trying DOM clipboard upload...")
+    dom_ok, dom_result = try_dom_clipboard_upload(window_idx, tab_idx, browser)
+    log(f"  Step 3c DOM: {dom_result}")
+    if dom_ok:
+        log("  Step 3c: ✅ DOM upload triggered")
+        return True
 
     log("  Step 4: Sending Cmd+V...")
-    _, err = run_applescript(
-        'tell application "System Events" to key code 9 using command down'
-    )
-    if err:
-        log(f"  Step 4 error: {err}")
+    browser_pid = get_browser_pid(browser)
+    if not send_native_cmd_v(browser_pid):
+        log("  Step 4 error: native Cmd+V failed")
         return False
     log("  Step 4: ✅ paste sent")
     return True
@@ -459,8 +789,9 @@ class ScreenshotHandler(FileSystemEventHandler):
 class ScreenshotToAIApp(rumps.App):
     def __init__(self):
         super().__init__(name="ScreenshotToAI", title="📸", quit_button="Quit")
-        self.enabled  = True
+        self.enabled  = False
         self._watcher = None   # SpotlightScreenshotWatcher or watchdog Observer
+        self._setup_state = self._load_setup_state()
 
         # Pinned target: set explicitly via "Choose Target" menu.
         # When set, ALL screenshots go here regardless of active tab.
@@ -472,16 +803,24 @@ class ScreenshotToAIApp(rumps.App):
         self._last_service: str = ""
 
         # ── Menu items ────────────────────────────────────────────────────────
+        self.menu_title_item = rumps.MenuItem("Screenshot to AI")
+        self.menu_title_item.set_callback(None)
+        self.menu_subtitle_item = rumps.MenuItem("Drop screenshots into ChatGPT")
+        self.menu_subtitle_item.set_callback(None)
         self.toggle_item = rumps.MenuItem("Auto-paste", callback=self.toggle)
-        self.target_item = rumps.MenuItem("🎯  Set Target Tab", callback=self.set_target)
-        self.pin_item    = rumps.MenuItem("      No target — auto-detect", callback=self.clear_pin)
-        self.test_item   = rumps.MenuItem("↩  Paste Last Screenshot", callback=self.paste_last)
+        self.target_item = rumps.MenuItem("Choose Target Tab", callback=self.set_target)
+        self.pin_item    = rumps.MenuItem("Target: Auto-detect", callback=self.clear_pin)
+        self.test_item   = rumps.MenuItem("Paste Latest Screenshot", callback=self.paste_last)
         self.status_item = rumps.MenuItem("Last: —")
         self.status_item.set_callback(None)
-        self.login_item  = rumps.MenuItem("Start at Login", callback=self.toggle_login_item)
+        self.setup_item = rumps.MenuItem("Open Setup", callback=self.show_setup_window)
+        self.login_item  = rumps.MenuItem("Launch at Login", callback=self.toggle_login_item)
         self.login_item.state = 1 if self._is_agent_installed() else 0
 
         self.menu = [
+            self.menu_title_item,
+            self.menu_subtitle_item,
+            None,
             self.toggle_item,
             None,
             self.target_item,
@@ -489,6 +828,7 @@ class ScreenshotToAIApp(rumps.App):
             None,
             self.test_item,
             None,
+            self.setup_item,
             self.status_item,
             None,
             self.login_item,
@@ -500,12 +840,32 @@ class ScreenshotToAIApp(rumps.App):
         self._switch_refs  = None
         self._nsswitch     = None
         self._toggle_badge = None
-        self.toggle_item.state = 1   # checkmark fallback until NSSwitch attaches
+        self._setup_window = None
+        self._setup_label = None
+        self._setup_hint_label = None
+        self._setup_title_label = None
+        self._setup_row_labels = []
+        self._setup_row_title_labels = []
+        self._setup_row_detail_labels = []
+        self._setup_row_views = []
+        self._menu_header_view = None
+        self._menu_header_subtitle = None
+        self._menu_header_badge = None
+        self._setup_button_targets = []
+        self._setup_buttons = {}
+        self.toggle_item.state = 0   # checkmark fallback until NSSwitch attaches
 
         if _NSSWITCH_AVAILABLE:
             rumps.Timer(self._deferred_attach_switch, 0.4).start()
 
-        self._start_watcher()
+        self._refresh_setup_state(check_permissions=False)
+        self.enabled = False
+        self.title = "📸✕"
+        if self._setup_completed() and self._setup_state.get("ready"):
+            self._set_status("Ready")
+        else:
+            self._set_status("Setup required")
+            rumps.Timer(self._deferred_first_run_prompt, 0.8).start()
 
         # Auto-discover an AI tab on startup so first screenshot works immediately
         threading.Thread(target=self._auto_discover, daemon=True).start()
@@ -543,6 +903,8 @@ class ScreenshotToAIApp(rumps.App):
                 log("NSSwitch: NSMenu not found — checkmark fallback")
                 self.toggle_item.state = 1 if self.enabled else 0
                 return
+
+            self._attach_menu_header()
 
             idx = ns_menu.indexOfItemWithTitle_("Auto-paste")
             if idx == -1:
@@ -626,6 +988,438 @@ class ScreenshotToAIApp(rumps.App):
         sw = getattr(self, "_nsswitch", None)
         if sw is not None:
             sw.setNeedsDisplay_(True)
+        subtitle = getattr(self, "_menu_header_subtitle", None)
+        if subtitle is not None:
+            subtitle.setStringValue_(self._menu_header_subtitle_text())
+        self._refresh_menu_header_badge()
+
+    def _menu_header_subtitle_text(self) -> str:
+        if self.enabled:
+            return "Watching for new screenshots"
+        if not self._setup_completed():
+            return "Finish setup, then turn on Auto-paste"
+        return "Ready when you want to enable it"
+
+    def _menu_header_badge_text(self) -> str:
+        if self.enabled:
+            return "LIVE"
+        if not self._setup_completed():
+            return "SETUP"
+        return "READY"
+
+    def _refresh_menu_header_badge(self):
+        badge = getattr(self, "_menu_header_badge", None)
+        if badge is None:
+            return
+        badge.setStringValue_(self._menu_header_badge_text())
+        if self.enabled:
+            badge.setTextColor_(NSColor.systemGreenColor())
+        elif not self._setup_completed():
+            badge.setTextColor_(NSColor.systemOrangeColor())
+        else:
+            badge.setTextColor_(NSColor.systemBlueColor())
+
+    def _attach_menu_header(self):
+        if not _NSSWITCH_AVAILABLE:
+            return
+        try:
+            view = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, 260, 62))
+
+            title = NSTextField.labelWithString_("Screenshot to AI")
+            title.setFrame_(NSMakeRect(14, 31, 180, 18))
+            title.setFont_(NSFont.boldSystemFontOfSize_(15.0))
+            view.addSubview_(title)
+
+            subtitle = NSTextField.labelWithString_(self._menu_header_subtitle_text())
+            subtitle.setFrame_(NSMakeRect(14, 13, 190, 14))
+            subtitle.setFont_(NSFont.systemFontOfSize_(11.0))
+            subtitle.setTextColor_(NSColor.secondaryLabelColor())
+            view.addSubview_(subtitle)
+
+            badge = NSTextField.labelWithString_(self._menu_header_badge_text())
+            badge.setFrame_(NSMakeRect(204, 27, 44, 16))
+            badge.setAlignment_(2)
+            badge.setFont_(NSFont.boldSystemFontOfSize_(10.0))
+            view.addSubview_(badge)
+
+            self.menu_title_item.setView_(view)
+            self.menu_subtitle_item.setHidden_(True)
+            self._menu_header_view = view
+            self._menu_header_subtitle = subtitle
+            self._menu_header_badge = badge
+            self._refresh_menu_header_badge()
+        except Exception:
+            pass
+
+    def _load_setup_state(self) -> Dict[str, object]:
+        try:
+            with open(SETUP_STATE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            log(f"Setup state load failed: {e}")
+        return {}
+
+    def _save_setup_state(self):
+        try:
+            os.makedirs(APP_SUPPORT_DIR, exist_ok=True)
+            with open(SETUP_STATE_PATH, "w", encoding="utf-8") as f:
+                json.dump(self._setup_state, f)
+        except Exception as e:
+            log(f"Setup state save failed: {e}")
+
+    def _required_dirs(self) -> List[str]:
+        return get_screenshot_dirs()
+
+    def _missing_setup_steps(self) -> List[str]:
+        missing = []
+        required_dirs = self._required_dirs()
+        blocked_dirs = [d for d in required_dirs if not can_access_directory(d)]
+        if blocked_dirs:
+            missing.append(os.path.basename(blocked_dirs[0]) or blocked_dirs[0])
+        return missing
+
+    def _setup_ready(self) -> bool:
+        return not self._missing_setup_steps()
+
+    def _setup_completed(self) -> bool:
+        return bool(self._setup_state.get("completed"))
+
+    def _refresh_setup_state(self, check_permissions: bool = True):
+        if check_permissions:
+            missing = self._missing_setup_steps()
+            self._setup_state["missing_steps"] = missing
+            self._setup_state["ready"] = not missing
+        else:
+            self._setup_state.setdefault("missing_steps", [])
+            self._setup_state.setdefault("ready", False)
+        self._save_setup_state()
+        self._update_setup_ui()
+
+    def _update_setup_ui(self):
+        def _apply():
+            missing = self._setup_state.get("missing_steps", [])
+            if not self._setup_completed():
+                self.setup_item.title = "Open Setup"
+            elif not missing:
+                self.setup_item.title = "Open Setup"
+            else:
+                self.setup_item.title = "Open Setup"
+        self._run_on_main(_apply)
+
+    def _request_folder_access(self) -> bool:
+        required_dirs = self._required_dirs()
+        if not required_dirs:
+            return True
+        for path in required_dirs:
+            if can_access_directory(path):
+                continue
+            try:
+                with os.scandir(path) as it:
+                    next(it, None)
+            except PermissionError:
+                pass
+            except Exception:
+                pass
+            if not can_access_directory(path):
+                self._notify(
+                    "Allow Folder Access",
+                    f"Allow access to {os.path.basename(path) or path}, then click Complete Setup again.",
+                )
+                self._set_status(f"Allow {os.path.basename(path) or path} access")
+                return False
+        return True
+
+    def _deferred_first_run_prompt(self, timer):
+        timer.stop()
+        if self._setup_completed():
+            return
+        self._run_on_main(self.show_setup_window)
+
+    def _setup_checklist_text(self) -> str:
+        self._refresh_setup_state()
+        folder_ready = not self._setup_state.get("missing_steps")
+        access_ready = is_accessibility_trusted()
+        test_ready = bool(self._setup_state.get("test_paste_ok"))
+        folder_label = self._required_dirs()[0] if self._required_dirs() else "Screenshot folder"
+        return (
+            f"{'✓' if folder_ready else '○'} Folder access for {os.path.basename(folder_label) or folder_label}\n"
+            f"{'✓' if access_ready else '○'} Accessibility for reliable paste shortcuts\n"
+            f"{'✓' if test_ready else '○'} Test paste completed successfully"
+        )
+
+    def _setup_row_data(self):
+        self._refresh_setup_state()
+        folder_ready = not self._setup_state.get("missing_steps")
+        access_ready = is_accessibility_trusted()
+        test_ready = bool(self._setup_state.get("test_paste_ok"))
+        folder_label = self._required_dirs()[0] if self._required_dirs() else "Screenshot folder"
+        return [
+            (
+                folder_ready,
+                "Folder access",
+                os.path.basename(folder_label) or folder_label,
+            ),
+            (
+                access_ready,
+                "Accessibility",
+                "Recommended for reliable keyboard paste",
+            ),
+            (
+                test_ready,
+                "Test paste",
+                "Verify a screenshot lands in the active chat",
+            ),
+        ]
+
+    def _setup_hint_text(self) -> str:
+        self._refresh_setup_state()
+        if not self._setup_completed():
+            return (
+                "Start with Complete Setup. The app will ask for access only when you choose it."
+            )
+        if self._setup_state.get("missing_steps"):
+            missing = self._setup_state["missing_steps"][0]
+            return f"One step remains: allow access to {missing}, then click Complete Setup again."
+        if not self._setup_state.get("test_paste_ok"):
+            return "Setup is almost done. Run Test Paste once to verify Chrome receives uploads."
+        return "Everything is ready. You can close this window and turn on Auto-paste anytime."
+
+    def _setup_footer_text(self) -> str:
+        if self.enabled:
+            return "Auto-paste is on"
+        if self._setup_completed() and not self._setup_state.get("missing_steps"):
+            return "Ready to enable"
+        return "Setup in progress"
+
+    def _style_setup_button(self, button, key: str):
+        button.setBezelStyle_(1)
+        if key == "primary":
+            try:
+                button.setKeyEquivalent_("\r")
+            except Exception:
+                pass
+
+    def _make_card_view(self, frame, background):
+        card = NSView.alloc().initWithFrame_(frame)
+        card.setWantsLayer_(True)
+        try:
+            card.layer().setCornerRadius_(14.0)
+            card.layer().setBackgroundColor_(background.CGColor())
+        except Exception:
+            pass
+        return card
+
+    def _ensure_setup_window(self):
+        if self._setup_window is not None or not _NSSWITCH_AVAILABLE:
+            return
+        frame = NSMakeRect(0, 0, 600, 560)
+        window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+            frame,
+            NSWindowStyleMaskTitled | NSWindowStyleMaskClosable,
+            NSBackingStoreBuffered,
+            False,
+        )
+        window.setTitle_("Screenshot to AI Setup")
+        try:
+            window.setAppearance_(NSAppearance.appearanceNamed_("NSAppearanceNameAqua"))
+        except Exception:
+            pass
+
+        content = window.contentView()
+        content.setWantsLayer_(True)
+        try:
+            content.layer().setBackgroundColor_(
+                NSColor.colorWithCalibratedRed_green_blue_alpha_(0.96, 0.97, 0.99, 1.0).CGColor()
+            )
+        except Exception:
+            pass
+
+        hero = self._make_card_view(
+            NSMakeRect(24, 404, 552, 126),
+            NSColor.colorWithCalibratedRed_green_blue_alpha_(0.14, 0.35, 0.82, 1.0),
+        )
+        content.addSubview_(hero)
+
+        title = NSTextField.labelWithString_("Finish Setup")
+        title.setFrame_(NSMakeRect(28, 68, 320, 34))
+        title.setFont_(NSFont.boldSystemFontOfSize_(30.0))
+        title.setTextColor_(NSColor.whiteColor())
+        hero.addSubview_(title)
+
+        subtitle = NSTextField.labelWithString_(
+            "Set permissions once, verify paste, then let the app quietly catch new screenshots."
+        )
+        subtitle.setFrame_(NSMakeRect(28, 28, 420, 30))
+        subtitle.setFont_(NSFont.systemFontOfSize_(15.0))
+        subtitle.setTextColor_(NSColor.colorWithCalibratedWhite_alpha_(0.92, 1.0))
+        subtitle.setUsesSingleLineMode_(False)
+        subtitle.setLineBreakMode_(NSLineBreakByWordWrapping)
+        hero.addSubview_(subtitle)
+
+        hero_badge = NSTextField.labelWithString_("")
+        hero_badge.setFrame_(NSMakeRect(442, 76, 82, 18))
+        hero_badge.setAlignment_(2)
+        hero_badge.setFont_(NSFont.boldSystemFontOfSize_(11.0))
+        hero_badge.setTextColor_(NSColor.colorWithCalibratedWhite_alpha_(0.95, 1.0))
+        hero.addSubview_(hero_badge)
+
+        checklist_label = NSTextField.labelWithString_("Setup checklist")
+        checklist_label.setFrame_(NSMakeRect(34, 368, 160, 18))
+        checklist_label.setFont_(NSFont.boldSystemFontOfSize_(12.0))
+        checklist_label.setTextColor_(NSColor.secondaryLabelColor())
+        content.addSubview_(checklist_label)
+
+        body = NSTextField.alloc().initWithFrame_(NSMakeRect(34, 342, 300, 20))
+        body.setBezeled_(False)
+        body.setDrawsBackground_(False)
+        body.setEditable_(False)
+        body.setSelectable_(False)
+        body.setFont_(NSFont.boldSystemFontOfSize_(16.0))
+        body.setTextColor_(NSColor.secondaryLabelColor())
+        content.addSubview_(body)
+
+        row_views = []
+        row_title_labels = []
+        row_detail_labels = []
+        row_status_labels = []
+        row_y = 274
+        for _ in range(3):
+            card = self._make_card_view(
+                NSMakeRect(34, row_y, 532, 72),
+                NSColor.whiteColor(),
+            )
+            status = NSTextField.labelWithString_("○")
+            status.setFrame_(NSMakeRect(20, 24, 28, 24))
+            status.setFont_(NSFont.boldSystemFontOfSize_(22.0))
+            card.addSubview_(status)
+
+            row_title = NSTextField.labelWithString_("")
+            row_title.setFrame_(NSMakeRect(58, 38, 260, 18))
+            row_title.setFont_(NSFont.boldSystemFontOfSize_(16.0))
+            card.addSubview_(row_title)
+
+            row_detail = NSTextField.labelWithString_("")
+            row_detail.setFrame_(NSMakeRect(58, 18, 430, 16))
+            row_detail.setFont_(NSFont.systemFontOfSize_(13.0))
+            row_detail.setTextColor_(NSColor.secondaryLabelColor())
+            card.addSubview_(row_detail)
+
+            content.addSubview_(card)
+            row_views.append(card)
+            row_status_labels.append(status)
+            row_title_labels.append(row_title)
+            row_detail_labels.append(row_detail)
+            row_y -= 88
+
+        hint_card = self._make_card_view(
+            NSMakeRect(34, 92, 532, 90),
+            NSColor.colorWithCalibratedRed_green_blue_alpha_(0.94, 0.97, 1.0, 1.0),
+        )
+        content.addSubview_(hint_card)
+
+        hint_title = NSTextField.labelWithString_("What to do next")
+        hint_title.setFrame_(NSMakeRect(18, 58, 160, 18))
+        hint_title.setFont_(NSFont.boldSystemFontOfSize_(12.0))
+        hint_title.setTextColor_(NSColor.secondaryLabelColor())
+        hint_card.addSubview_(hint_title)
+
+        hint = NSTextField.alloc().initWithFrame_(NSMakeRect(18, 18, 496, 34))
+        hint.setBezeled_(False)
+        hint.setDrawsBackground_(False)
+        hint.setEditable_(False)
+        hint.setSelectable_(False)
+        hint.setUsesSingleLineMode_(False)
+        hint.setLineBreakMode_(NSLineBreakByWordWrapping)
+        hint.setFont_(NSFont.systemFontOfSize_(13.0))
+        hint.setTextColor_(NSColor.labelColor())
+        hint_card.addSubview_(hint)
+
+        buttons = [
+            ("Complete Setup", self.complete_setup, 34, 28, 150, "primary"),
+            ("Grant Accessibility", self.grant_accessibility, 198, 28, 170, "secondary"),
+            ("Test Paste", self.paste_last, 382, 28, 104, "secondary"),
+            ("Reset", self.reset_setup, 500, 28, 66, "secondary"),
+        ]
+
+        for label, callback, x, y, width, role in buttons:
+            btn = NSButton.alloc().initWithFrame_(NSMakeRect(x, y, width, 36))
+            btn.setTitle_(label)
+            self._style_setup_button(btn, role)
+            target = _CallbackTarget.alloc().init_with_callback(callback)
+            btn.setTarget_(target)
+            btn.setAction_(objc.selector(target.triggered_, signature=b'v@:@'))
+            self._setup_button_targets.append(target)
+            self._setup_buttons[label] = btn
+            content.addSubview_(btn)
+
+        self._setup_window = window
+        self._setup_title_label = title
+        self._setup_label = body
+        self._setup_hint_label = hint
+        self._setup_footer_label = hero_badge
+        self._setup_row_labels = row_status_labels
+        self._setup_row_title_labels = row_title_labels
+        self._setup_row_detail_labels = row_detail_labels
+        self._setup_row_views = row_views
+        self._refresh_setup_window()
+
+    def _refresh_setup_window(self):
+        if self._setup_label is None:
+            return
+        if self._setup_completed() and not self._setup_state.get("missing_steps"):
+            self._setup_label.setStringValue_("Everything looks good")
+        else:
+            self._setup_label.setStringValue_("Finish these three steps")
+        row_data = self._setup_row_data()
+        for idx, row in enumerate(row_data):
+            ready, title, detail = row
+            status = self._setup_row_labels[idx]
+            title_label = self._setup_row_title_labels[idx]
+            detail_label = self._setup_row_detail_labels[idx]
+            card = self._setup_row_views[idx]
+            status.setStringValue_("✓" if ready else "○")
+            status.setTextColor_(
+                NSColor.systemGreenColor() if ready else NSColor.tertiaryLabelColor()
+            )
+            title_label.setStringValue_(title)
+            detail_label.setStringValue_(detail)
+            try:
+                card.layer().setBackgroundColor_(
+                    (NSColor.colorWithCalibratedRed_green_blue_alpha_(0.91, 0.98, 0.93, 1.0) if ready
+                     else NSColor.whiteColor()).CGColor()
+                )
+            except Exception:
+                pass
+        if self._setup_hint_label is not None:
+            self._setup_hint_label.setStringValue_(self._setup_hint_text())
+        footer = getattr(self, "_setup_footer_label", None)
+        if footer is not None:
+            footer.setStringValue_(self._setup_footer_text().upper())
+        complete_button = self._setup_buttons.get("Complete Setup")
+        test_button = self._setup_buttons.get("Test Paste")
+        if complete_button is not None:
+            complete_button.setEnabled_(not self._setup_completed() or bool(self._setup_state.get("missing_steps")))
+        if test_button is not None:
+            test_button.setEnabled_(self._setup_completed() and not self._setup_state.get("missing_steps"))
+
+    def show_setup_window(self, _=None):
+        if not _NSSWITCH_AVAILABLE:
+            self._notify(
+                "Open Setup",
+                "Open the menu and use Complete Setup, Grant Accessibility, and Paste Last Screenshot.",
+            )
+            return
+        try:
+            NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+            self._ensure_setup_window()
+            self._refresh_setup_window()
+            self._setup_window.makeKeyAndOrderFront_(None)
+        except Exception as e:
+            log(f"First-run prompt failed: {e}")
 
     # ── Auto-discover on startup ───────────────────────────────────────────────
 
@@ -663,12 +1457,27 @@ class ScreenshotToAIApp(rumps.App):
             sender.state = 1 if new_state else 0
 
     def _apply_toggle(self, is_on: bool):
-        self.enabled = is_on
-        self.title   = "📸" if is_on else "📸✕"
         if is_on:
+            self._refresh_setup_state()
+            if not self._setup_completed() or not self._setup_ready():
+                self.enabled = False
+                self.title = "📸✕"
+                if self._nsswitch is not None:
+                    self._nsswitch.setState_(0)
+                self.toggle_item.state = 0
+                self._update_toggle_badge()
+                self._notify(
+                    "Setup Required",
+                    "Click Complete Setup first.",
+                )
+                return
+            self.enabled = True
+            self.title   = "📸"
             self._start_watcher()
             log("Auto-paste enabled")
         else:
+            self.enabled = False
+            self.title   = "📸✕"
             self._stop_watcher()
             log("Auto-paste disabled")
 
@@ -744,21 +1553,27 @@ class ScreenshotToAIApp(rumps.App):
         self._notify("Pin cleared", "Back to auto-detect mode.")
 
     def _update_pin_label(self):
-        if self._pinned_tab:
-            self.pin_item.title = f"      📌 {self._pinned_service} pinned  (click to clear)"
-        elif self._last_tab:
-            self.pin_item.title = f"      🔍 Auto: {self._last_service}"
-        else:
-            self.pin_item.title = "      No target — auto-detect"
+        def _apply():
+            if self._pinned_tab:
+                self.pin_item.title = f"Target: {self._pinned_service} pinned"
+            elif self._last_tab:
+                self.pin_item.title = f"Target: Auto ({self._last_service})"
+            else:
+                self.pin_item.title = "Target: Auto-detect"
+        self._run_on_main(_apply)
 
     # ── Manual retry ──────────────────────────────────────────────────────────
 
     def paste_last(self, _):
+        self._refresh_setup_state()
+        # Read the user's custom screenshot prefix (defaults to "Screenshot")
+        r = run_command(["defaults", "read", "com.apple.screencapture", "name"])
+        prefix = r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else "Screenshot"
         candidates = []
         for d in get_screenshot_dirs():
-            for pattern in ("Screenshot*.png", "Screenshot*.jpg", "Screenshot*.jpeg"):
+            for ext in ("png", "jpg", "jpeg", "tiff", "tif"):
                 candidates += [
-                    f for f in glob.glob(os.path.join(d, pattern))
+                    f for f in glob.glob(os.path.join(d, f"{prefix}*.{ext}"))
                     if not os.path.basename(f).startswith(".")
                 ]
         if not candidates:
@@ -774,51 +1589,43 @@ class ScreenshotToAIApp(rumps.App):
         if self._watcher and self._watcher.is_alive():
             return
 
-        # ── Primary: Spotlight via mdfind (no permissions needed) ─────────────
+        # ── Primary: watchdog on the actual screenshot directories ─────────────
+        if not _WATCHDOG_AVAILABLE:
+            log("watchdog unavailable, trying Spotlight watcher")
+        else:
+            handler = ScreenshotHandler(self)
+            watcher = Observer()
+            watched_any = False
+            for d in get_screenshot_dirs():
+                try:
+                    watcher.schedule(handler, d, recursive=False)
+                    log(f"Watching (watchdog): {d}")
+                    watched_any = True
+                except PermissionError:
+                    log(f"⚠️  Permission denied watching {d}")
+
+            if watched_any:
+                watcher.start()
+                self._watcher = watcher
+                return
+
+            log("No screenshot directories watchable via watchdog, trying Spotlight")
+
+        # ── Fallback: Spotlight via mdfind ────────────────────────────────────
         try:
-            test = subprocess.run(
+            test = run_command(
                 ["mdfind", "-onlyin", os.path.expanduser("~"),
                  "kMDItemIsScreenCapture == 1"],
-                capture_output=True, text=True, timeout=3
+                timeout=3
             )
             if test.returncode == 0:
                 self._watcher = SpotlightScreenshotWatcher(self.handle_new_screenshot)
                 self._watcher.start()
                 return
         except Exception as e:
-            log(f"Spotlight unavailable ({e}), falling back to watchdog")
+            log(f"Spotlight unavailable ({e})")
 
-        # ── Fallback: watchdog (needs Full Disk Access) ────────────────────────
-        if not _WATCHDOG_AVAILABLE:
-            log("❌ Neither Spotlight nor watchdog available")
-            return
-
-        handler = ScreenshotHandler(self)
-        watcher = Observer()
-        watched_any = False
-        for d in get_screenshot_dirs():
-            try:
-                watcher.schedule(handler, d, recursive=False)
-                log(f"Watching (watchdog): {d}")
-                watched_any = True
-            except PermissionError:
-                log(f"⚠️  Permission denied watching {d}")
-
-        if not watched_any:
-            log("❌ No directories watchable — Full Disk Access needed")
-            self._notify(
-                "Full Disk Access needed ⚠️",
-                "Opening System Settings → grant access, then relaunch."
-            )
-            subprocess.run(
-                ["open",
-                 "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"],
-                capture_output=True
-            )
-            return
-
-        watcher.start()
-        self._watcher = watcher
+        log("❌ Neither watchdog nor Spotlight watcher could start")
 
     def _stop_watcher(self):
         if self._watcher:
@@ -859,10 +1666,7 @@ class ScreenshotToAIApp(rumps.App):
             time.sleep(0.2)
 
         # ── Edge case: Chrome not running at all ──────────────────────────────
-        chrome_check, _ = run_applescript(
-            'tell application "System Events" to return (name of processes) contains "Google Chrome"'
-        )
-        if chrome_check.strip().lower() != "true":
+        if not is_chrome_running():
             log("  ❌ Google Chrome is not running")
             self._notify("Chrome not running ⚠️",
                          "Open Google Chrome with Claude.ai or ChatGPT to use auto-paste.")
@@ -872,10 +1676,20 @@ class ScreenshotToAIApp(rumps.App):
         # Priority 1 — explicitly pinned tab
         tab, used_pin, used_fallback = None, False, False
 
-        if self._pinned_tab and verify_tab(*self._pinned_tab):
-            tab      = self._pinned_tab
-            used_pin = True
-            log(f"  Using pinned tab: {self._pinned_service}")
+        if self._pinned_tab:
+            if verify_tab(*self._pinned_tab):
+                tab      = self._pinned_tab
+                used_pin = True
+                log(f"  Using pinned tab: {self._pinned_service}")
+            else:
+                log(f"  Pinned tab ({self._pinned_service}) is gone — clearing pin")
+                self._notify(
+                    f"Pinned tab closed ⚠️",
+                    f"{self._pinned_service} tab is no longer open. Pin cleared — switching to auto-detect."
+                )
+                self._pinned_tab     = None
+                self._pinned_service = ""
+                self._run_on_main(self._update_pin_label)
 
         # Priority 2 — currently active AI tab in Chrome
         if tab is None:
@@ -919,6 +1733,10 @@ class ScreenshotToAIApp(rumps.App):
                     self._last_service = svc
                     self._update_pin_label()
 
+                self._setup_state["test_paste_ok"] = True
+                self._save_setup_state()
+                self._run_on_main(self._refresh_setup_window)
+
                 if used_pin:
                     label = f"{svc} 📌"
                 elif used_fallback:
@@ -930,8 +1748,11 @@ class ScreenshotToAIApp(rumps.App):
                 self._set_status(f"✅  {filename} → {label}")
                 log(f"✅ Done → {label}")
             else:
-                self._notify("Clipboard error ❌", "Could not copy image.")
-                self._set_status("❌  clipboard error")
+                self._notify(
+                    "Paste failed ⚠️",
+                    "Grant Accessibility to Screenshot to AI, then try again.",
+                )
+                self._set_status("❌  paste failed")
         except Exception as e:
             log(f"  ❌ Exception: {e}")
             self._notify("Error ❌", str(e))
@@ -1024,13 +1845,83 @@ class ScreenshotToAIApp(rumps.App):
             self._notify("Added to Login Items ✅",
                          "The 📸 icon will appear automatically every time you log in.")
 
+    def grant_accessibility(self, _):
+        if is_accessibility_trusted(prompt=True):
+            self._set_status("✅  Accessibility granted")
+            self._notify("Accessibility already enabled", "Auto-paste is ready.")
+            self._run_on_main(self._refresh_setup_window)
+            return
+        self._set_status("⚠️  Enable Accessibility, then turn Auto-paste on")
+        self._notify(
+            "Grant Accessibility",
+            "Turn on Screenshot to AI in System Settings, then re-enable Auto-paste.",
+        )
+        self._run_on_main(self._refresh_setup_window)
+
+    def complete_setup(self, _):
+        self._refresh_setup_state()
+        if not self._request_folder_access():
+            self._refresh_setup_state()
+            return
+        self._refresh_setup_state()
+        self._setup_state["completed"] = True
+        self._save_setup_state()
+        self.enabled = True
+        self.title = "📸"
+        if self._nsswitch is not None:
+            self._nsswitch.setState_(1)
+        self.toggle_item.state = 1
+        self._update_toggle_badge()
+        self._start_watcher()
+        self._set_status("Setup complete")
+        self._notify(
+            "Setup Complete ✅",
+            "Folder access is ready. Auto-paste is on.",
+        )
+        self._run_on_main(self._refresh_setup_window)
+
+    def reset_setup(self, _):
+        self._setup_state = {"completed": False, "ready": False, "missing_steps": []}
+        self._save_setup_state()
+        self.enabled = False
+        self.title = "📸✕"
+        if self._nsswitch is not None:
+            self._nsswitch.setState_(0)
+        self.toggle_item.state = 0
+        self._update_toggle_badge()
+        self._stop_watcher()
+        self._set_status("Setup reset")
+        self._update_setup_ui()
+        self._refresh_setup_window()
+        self.show_setup_window()
+
+    def _ensure_accessibility(self, prompt: bool, notify: bool) -> bool:
+        if is_accessibility_trusted(prompt=prompt):
+            return True
+        log("Accessibility permission missing")
+        self._set_status("⚠️  Accessibility required")
+        if notify:
+            self._notify(
+                "Accessibility required",
+                "Enable Screenshot to AI in System Settings to allow pasting into Chrome.",
+            )
+        return False
+
+    def _run_on_main(self, fn, *args):
+        if _APPHELPER_AVAILABLE:
+            AppHelper.callAfter(fn, *args)
+        else:
+            fn(*args)
+
     # ── Notifications / status ─────────────────────────────────────────────────
 
     def _notify(self, subtitle: str, message: str):
-        rumps.notification("Screenshot to AI", subtitle, message, sound=False)
+        self._run_on_main(
+            lambda: rumps.notification("Screenshot to AI", subtitle, message, sound=False)
+        )
 
     def _set_status(self, text: str):
-        self.status_item.title = f"Last: {text}"
+        self._run_on_main(lambda: setattr(self.status_item, "title", f"Last: {text}"))
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
@@ -1059,13 +1950,7 @@ if __name__ == "__main__":
         sys.exit(0)
 
     # ── Suppress Dock icon ─────────────────────────────────────────────────────
-    try:
-        from AppKit import NSApplication, NSApplicationActivationPolicyAccessory
-        NSApplication.sharedApplication().setActivationPolicy_(
-            NSApplicationActivationPolicyAccessory
-        )
-    except Exception:
-        pass
+    suppress_dock_icon()
 
     log("Starting…")
     ScreenshotToAIApp().run()

@@ -1,10 +1,11 @@
 app.py
 setup.py
 requirements.txt
-build/
-dist/
-ScreenshotToAI.zip
+*.py
 *.icns
 *.pyc
+*.zip
+build/
+dist/
 __pycache__/
-.git/
+icon.iconset/

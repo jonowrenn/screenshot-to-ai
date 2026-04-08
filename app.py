@@ -808,13 +808,13 @@ class ScreenshotToAIApp(rumps.App):
         self.menu_subtitle_item = rumps.MenuItem("Drop screenshots into ChatGPT")
         self.menu_subtitle_item.set_callback(None)
         self.toggle_item = rumps.MenuItem("Auto-paste", callback=self.toggle)
-        self.target_item = rumps.MenuItem("Choose Target Tab", callback=self.set_target)
+        self.target_item = rumps.MenuItem("🎯  Set Target", callback=self.set_target)
         self.pin_item    = rumps.MenuItem("Target: Auto-detect", callback=self.clear_pin)
-        self.test_item   = rumps.MenuItem("Paste Latest Screenshot", callback=self.paste_last)
+        self.test_item   = rumps.MenuItem("↩  Re-paste Last", callback=self.paste_last)
         self.status_item = rumps.MenuItem("Last: —")
         self.status_item.set_callback(None)
-        self.setup_item = rumps.MenuItem("Open Setup", callback=self.show_setup_window)
-        self.login_item  = rumps.MenuItem("Launch at Login", callback=self.toggle_login_item)
+        self.setup_item  = rumps.MenuItem("⚙️  Setup", callback=self.show_setup_window)
+        self.login_item  = rumps.MenuItem("  Launch at Login", callback=self.toggle_login_item)
         self.login_item.state = 1 if self._is_agent_installed() else 0
 
         self.menu = [
@@ -828,9 +828,9 @@ class ScreenshotToAIApp(rumps.App):
             None,
             self.test_item,
             None,
-            self.setup_item,
             self.status_item,
             None,
+            self.setup_item,
             self.login_item,
         ]
 
@@ -970,6 +970,9 @@ class ScreenshotToAIApp(rumps.App):
             self._toggle_ns_item = new_item
             log("NSSwitch toggle attached ✅")
 
+            self._attach_target_row(ns_menu)
+            self._attach_status_row(ns_menu)
+
         except Exception:
             log(f"NSSwitch setup failed (checkmark fallback):\n{traceback.format_exc()}")
             self.toggle_item.state = 1 if self.enabled else 0
@@ -1023,23 +1026,33 @@ class ScreenshotToAIApp(rumps.App):
         if not _NSSWITCH_AVAILABLE:
             return
         try:
-            view = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, 260, 62))
+            W, H = 260, 70
+            view = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, W, H))
 
+            # Camera emoji icon
+            icon = NSTextField.labelWithString_("📸")
+            icon.setFrame_(NSMakeRect(14, 26, 26, 22))
+            icon.setFont_(NSFont.systemFontOfSize_(18.0))
+            view.addSubview_(icon)
+
+            # Title
             title = NSTextField.labelWithString_("Screenshot to AI")
-            title.setFrame_(NSMakeRect(14, 31, 180, 18))
-            title.setFont_(NSFont.boldSystemFontOfSize_(15.0))
+            title.setFrame_(NSMakeRect(44, 38, 160, 18))
+            title.setFont_(NSFont.boldSystemFontOfSize_(14.0))
             view.addSubview_(title)
 
+            # Subtitle
             subtitle = NSTextField.labelWithString_(self._menu_header_subtitle_text())
-            subtitle.setFrame_(NSMakeRect(14, 13, 190, 14))
+            subtitle.setFrame_(NSMakeRect(44, 20, 170, 14))
             subtitle.setFont_(NSFont.systemFontOfSize_(11.0))
             subtitle.setTextColor_(NSColor.secondaryLabelColor())
             view.addSubview_(subtitle)
 
+            # Status pill badge (LIVE / READY / SETUP)
             badge = NSTextField.labelWithString_(self._menu_header_badge_text())
-            badge.setFrame_(NSMakeRect(204, 27, 44, 16))
-            badge.setAlignment_(2)
-            badge.setFont_(NSFont.boldSystemFontOfSize_(10.0))
+            badge.setFrame_(NSMakeRect(200, 40, 46, 14))
+            badge.setAlignment_(2)  # right-align
+            badge.setFont_(NSFont.boldSystemFontOfSize_(9.5))
             view.addSubview_(badge)
 
             self.menu_title_item.setView_(view)
@@ -1050,6 +1063,101 @@ class ScreenshotToAIApp(rumps.App):
             self._refresh_menu_header_badge()
         except Exception:
             pass
+
+    def _attach_target_row(self, ns_menu):
+        """Replace the plain 'Set Target' + pin_item rows with a single custom row."""
+        if not _NSSWITCH_AVAILABLE:
+            return
+        try:
+            idx = ns_menu.indexOfItemWithTitle_("🎯  Set Target")
+            if idx == -1:
+                return
+
+            W, H = 260, 34
+            view = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, W, H))
+
+            # Left label
+            lbl = NSTextField.labelWithString_("🎯  Set Target")
+            lbl.setFrame_(NSMakeRect(14, 9, 130, 16))
+            lbl.setFont_(NSFont.menuFontOfSize_(13.0))
+            view.addSubview_(lbl)
+
+            # Right: current service name
+            svc_text = self._current_target_label()
+            svc = NSTextField.labelWithString_(svc_text)
+            svc.setFrame_(NSMakeRect(150, 9, 88, 16))
+            svc.setFont_(NSFont.systemFontOfSize_(11.5))
+            svc.setTextColor_(NSColor.secondaryLabelColor())
+            svc.setAlignment_(2)  # right-align
+            view.addSubview_(svc)
+
+            # Chevron ›
+            chev = NSTextField.labelWithString_("›")
+            chev.setFrame_(NSMakeRect(240, 9, 10, 16))
+            chev.setFont_(NSFont.systemFontOfSize_(13.0))
+            chev.setTextColor_(NSColor.tertiaryLabelColor())
+            view.addSubview_(chev)
+
+            new_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                "🎯  Set Target", None, ""
+            )
+            new_item.setTarget_(self.target_item._menuitem.target())
+            new_item.setAction_(self.target_item._menuitem.action())
+            new_item.setView_(view)
+
+            ns_menu.removeItemAtIndex_(idx)
+            ns_menu.insertItem_atIndex_(new_item, idx)
+
+            # Hide the separate pin_item row — state is shown in this view
+            pin_idx = ns_menu.indexOfItemWithTitle_("Target: Auto-detect")
+            if pin_idx == -1:
+                pin_idx = ns_menu.indexOfItemWithTitle_(self.pin_item.title)
+            if pin_idx != -1:
+                ns_menu.itemAtIndex_(pin_idx).setHidden_(True)
+
+            self._target_service_label = svc
+            self._target_ns_item = new_item
+            log("Target row attached ✅")
+        except Exception as e:
+            log(f"Target row attach failed: {e}")
+
+    def _attach_status_row(self, ns_menu):
+        """Replace the plain status item with a compact custom view."""
+        if not _NSSWITCH_AVAILABLE:
+            return
+        try:
+            idx = ns_menu.indexOfItemWithTitle_("Last: —")
+            if idx == -1:
+                return
+
+            W, H = 260, 26
+            view = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, W, H))
+
+            lbl = NSTextField.labelWithString_("Last: —")
+            lbl.setFrame_(NSMakeRect(14, 5, 236, 15))
+            lbl.setFont_(NSFont.systemFontOfSize_(11.0))
+            lbl.setTextColor_(NSColor.tertiaryLabelColor())
+            view.addSubview_(lbl)
+
+            new_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                "Last: —", None, ""
+            )
+            new_item.setView_(view)
+
+            ns_menu.removeItemAtIndex_(idx)
+            ns_menu.insertItem_atIndex_(new_item, idx)
+
+            self._status_custom_label = lbl
+            log("Status row attached ✅")
+        except Exception as e:
+            log(f"Status row attach failed: {e}")
+
+    def _current_target_label(self) -> str:
+        if self._pinned_tab:
+            return f"📌 {self._pinned_service}"
+        if self._last_tab:
+            return self._last_service
+        return "Auto"
 
     def _load_setup_state(self) -> Dict[str, object]:
         try:
@@ -1554,12 +1662,22 @@ class ScreenshotToAIApp(rumps.App):
 
     def _update_pin_label(self):
         def _apply():
+            # Fallback plain text (shown if custom view didn't attach)
             if self._pinned_tab:
-                self.pin_item.title = f"Target: {self._pinned_service} pinned"
+                self.pin_item.title = f"📌 {self._pinned_service} pinned"
             elif self._last_tab:
-                self.pin_item.title = f"Target: Auto ({self._last_service})"
+                self.pin_item.title = f"🔍 {self._last_service}"
             else:
                 self.pin_item.title = "Target: Auto-detect"
+
+            # Update custom view service label
+            svc_lbl = getattr(self, "_target_service_label", None)
+            if svc_lbl is not None:
+                svc_lbl.setStringValue_(self._current_target_label())
+                if self._pinned_tab:
+                    svc_lbl.setTextColor_(NSColor.systemOrangeColor())
+                else:
+                    svc_lbl.setTextColor_(NSColor.secondaryLabelColor())
         self._run_on_main(_apply)
 
     # ── Manual retry ──────────────────────────────────────────────────────────
@@ -1921,7 +2039,20 @@ class ScreenshotToAIApp(rumps.App):
         )
 
     def _set_status(self, text: str):
-        self._run_on_main(lambda: setattr(self.status_item, "title", f"Last: {text}"))
+        def _apply():
+            full = f"Last: {text}"
+            self.status_item.title = full
+            lbl = getattr(self, "_status_custom_label", None)
+            if lbl is not None:
+                lbl.setStringValue_(full)
+                # Muted green for success, orange for warnings, red for errors
+                if text.startswith("✅"):
+                    lbl.setTextColor_(NSColor.systemGreenColor())
+                elif text.startswith(("⚠️", "❌")):
+                    lbl.setTextColor_(NSColor.systemOrangeColor())
+                else:
+                    lbl.setTextColor_(NSColor.tertiaryLabelColor())
+        self._run_on_main(_apply)
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────

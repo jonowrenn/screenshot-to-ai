@@ -1,0 +1,10 @@
+app.py
+setup.py
+requirements.txt
+build/
+dist/
+ScreenshotToAI.zip
+*.icns
+*.pyc
+__pycache__/
+.git/
